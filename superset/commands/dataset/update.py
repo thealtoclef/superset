@@ -22,6 +22,7 @@ from functools import partial
 from typing import Any, cast, Optional
 from uuid import UUID
 
+from flask import current_app as app
 from flask_appbuilder.models.sqla import Model
 from marshmallow import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -52,18 +53,28 @@ from superset.connectors.sqla.models import SqlaTable, validate_stored_expressio
 from superset.daos.dataset import DatasetDAO
 from superset.datasets.schemas import FolderSchema
 from superset.exceptions import (
+    DatasetExecutionUserInvalidError,
     QueryClauseValidationException,
     SupersetParseError,
     SupersetSecurityException,
 )
 from superset.models.core import Database
 from superset.models.helpers import (
+    json_to_dict,
     parse_template_params,
     template_params_equivalent,
     template_params_for_access_check,
 )
 from superset.sql.parse import Table
+from superset.utils import json
+from superset.utils.core import get_user
 from superset.utils.decorators import on_error, transaction
+from superset.utils.execution_identity import (
+    can_assign_execution_user,
+    FEATURE_FLAG,
+    get_active_user,
+    supports_execution_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +115,8 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
         self._model_id = model_id
         self._properties = data.copy()
         self._model: Optional[SqlaTable] = None
+        self._execution_user: str | None = None
+        self._execution_user_changed = False
         self.override_columns = override_columns
         self._properties["override_columns"] = override_columns
 
@@ -120,7 +133,11 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
     def run(self) -> Model:
         self.validate()
         assert self._model
-        return DatasetDAO.update(self._model, attributes=self._properties)
+        dataset = DatasetDAO.update(self._model, attributes=self._properties)
+        if self._execution_user != dataset.get_execution_user_username():
+            dataset.set_execution_user_username(self._execution_user)
+            app.config["STATS_LOGGER"].incr("dataset.execution_user.set")
+        return dataset
 
     def validate(self) -> None:
         exceptions: list[ValidationError] = []
@@ -138,6 +155,8 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
 
         raise_if_managed_externally(self._model, DatasetForbiddenError)
 
+        self._validate_execution_user(exceptions)
+
         # Validate/Populate editors
         compute_subjects(self._model, self._properties, exceptions)
 
@@ -147,6 +166,52 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
         if exceptions:
             raise DatasetInvalidError(exceptions=exceptions)
 
+    def _validate_execution_user(  # noqa: C901
+        self, exceptions: list[ValidationError]
+    ) -> None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        stored = self._model.get_execution_user_username()
+        if not isinstance(stored, str):
+            stored = None
+        supplied = "execution_user" in self._properties
+        value = self._properties.pop("execution_user", None)
+
+        self._execution_user_changed = supplied and value != stored
+        if supplied and value != stored:
+            if not is_feature_enabled(FEATURE_FLAG):
+                exceptions.append(
+                    ValidationError(
+                        ["Feature is not enabled"], field_name="execution_user"
+                    )
+                )
+            elif not can_assign_execution_user(value):
+                raise DatasetForbiddenError()
+            elif value:
+                try:
+                    get_active_user(value)
+                except DatasetExecutionUserInvalidError as ex:
+                    exceptions.append(
+                        ValidationError([ex.message], field_name="execution_user")
+                    )
+
+        if "extra" in self._properties:
+            try:
+                extra = json_to_dict(self._properties["extra"] or "")
+            except ValueError:
+                extra = None
+            if extra is not None:
+                raw_value = extra.pop("execution_user", None)
+                if (
+                    raw_value != stored
+                    and get_user() is not None
+                    and not security_manager.is_admin()
+                ):
+                    raise DatasetForbiddenError()
+                self._properties["extra"] = json.dumps(extra)
+
+        self._execution_user = value if supplied else stored
+
     def _validate_dataset_source(self, exceptions: list[ValidationError]) -> None:
         # we know we have a valid model
         self._model = cast(SqlaTable, self._model)
@@ -154,6 +219,18 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
         new_db_connection = self._get_new_database_connection(database_id, exceptions)
         db = new_db_connection or self._model.database
         database_changed = new_db_connection is not None
+        if (
+            is_feature_enabled(FEATURE_FLAG)
+            and self._execution_user
+            and (self._execution_user_changed or database_changed)
+            and not supports_execution_user(db)
+        ):
+            exceptions.append(
+                ValidationError(
+                    ["Database does not support OAuth2 user impersonation"],
+                    field_name="execution_user",
+                )
+            )
 
         # Detect a caller-supplied change to the source binding, inspected
         # before the catalog normalization below injects derived values. The
@@ -172,6 +249,32 @@ class UpdateDatasetCommand(UpdateMixin, BaseCommand):
             "table_name" in self._properties
             and self._properties["table_name"] != self._model.table_name
         )
+        # Fork: a virtual dataset's SQL text and template params decide which
+        # tables it reads, so changing either repoints the source as well. A
+        # physical dataset has no SQL to repoint, so it is left out.
+        source_repointed = source_changed
+        if self._properties.get("sql", self._model.sql):
+            source_repointed = (
+                source_repointed
+                or (
+                    "sql" in self._properties
+                    and self._properties["sql"] != self._model.sql
+                )
+                or (
+                    "template_params" in self._properties
+                    and _template_params_differ(
+                        self._properties["template_params"],
+                        self._model.template_params,
+                    )
+                )
+            )
+        if (
+            is_feature_enabled(FEATURE_FLAG)
+            and source_repointed
+            and self._execution_user
+            and not can_assign_execution_user(self._execution_user)
+        ):
+            raise DatasetForbiddenError()
 
         catalog, schema, table = self._resolve_catalog_schema_table(db, exceptions)
 

@@ -23,6 +23,7 @@ import contextlib
 import copy
 import re
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any, cast, TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -103,6 +104,63 @@ def test_values_for_column(database: Database) -> None:
         return_value=pd.DataFrame({"column_values": [1, np.nan]}),
     ):
         assert table.values_for_column("a") == [1, None]
+
+
+def test_extra_cache_keys_plans_under_execution_identity(
+    database: Database, mocker: MockerFixture
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.utils.execution_identity import get_execution_user
+
+    user = SimpleNamespace(id=42, username="alice")
+    table = SqlaTable(database=database, table_name="t")
+    mocker.patch.object(table, "has_extra_cache_key_calls", return_value=True)
+    mocker.patch(
+        "superset.utils.execution_identity.resolve_execution_user", return_value=user
+    )
+    observed = []
+
+    def get_sqla_query(**kwargs: Any) -> Any:
+        observed.append(get_execution_user())
+        return SimpleNamespace(extra_cache_keys=[])
+
+    mocker.patch.object(table, "get_sqla_query", side_effect=get_sqla_query)
+
+    table.get_extra_cache_keys({})
+
+    assert observed == [user]
+
+
+def test_values_for_column_renders_under_execution_identity(
+    database: Database, mocker: MockerFixture
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable, TableColumn
+    from superset.utils.execution_identity import get_execution_user
+
+    user = SimpleNamespace(id=42, username="alice")
+    table = SqlaTable(
+        database=database,
+        schema=None,
+        table_name="t",
+        columns=[TableColumn(column_name="a")],
+    )
+    mocker.patch(
+        "superset.utils.execution_identity.resolve_execution_user", return_value=user
+    )
+    observed = []
+
+    def get_template_processor(**kwargs: Any) -> Any:
+        observed.append(get_execution_user())
+        raise RuntimeError("stop")
+
+    mocker.patch.object(
+        table, "get_template_processor", side_effect=get_template_processor
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        table.values_for_column("a")
+
+    assert observed == [user]
 
 
 def test_build_like_predicate_is_case_insensitive_and_escaped() -> None:

@@ -22,6 +22,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Hashable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, cast, Optional, Union
@@ -1936,6 +1937,7 @@ class SqlaTable(
             data_["is_sqllab_view"] = self.is_sqllab_view
             data_["health_check_message"] = self.health_check_message
             data_["extra"] = self.extra
+            data_["execution_user"] = self.execution_user
             data_["always_filter_main_dttm"] = self.always_filter_main_dttm
             data_["normalize_columns"] = self.normalize_columns
         return data_
@@ -1946,6 +1948,22 @@ class SqlaTable(
             return json.loads(self.extra)
         except (TypeError, json.JSONDecodeError):
             return {}
+
+    @property
+    def execution_user(self) -> str | None:
+        return self.get_execution_user_username()
+
+    def get_execution_user_username(self) -> str | None:
+        value = self.extra_dict.get("execution_user")
+        return value if isinstance(value, str) and value else None
+
+    def set_execution_user_username(self, username: str | None) -> None:
+        extra = dict(self.extra_dict)
+        if username:
+            extra["execution_user"] = username
+        else:
+            extra.pop("execution_user", None)
+        self.extra = json.dumps(extra)
 
     def get_fetch_values_predicate(
         self,
@@ -2734,31 +2752,43 @@ class SqlaTable(
         :param query_obj: query object to analyze
         :return: The extra cache keys
         """
+        from superset.utils.execution_identity import (
+            execution_identity,
+            resolve_execution_user,
+        )
         from superset.utils.rls import collect_rls_predicates_for_sql
 
-        extra_cache_keys = super().get_extra_cache_keys(query_obj)
-        if self.has_extra_cache_key_calls(query_obj):
-            # Filter out keys that aren't parameters to get_sqla_query
-            filtered_query_obj = {
-                k: v for k, v in query_obj.items() if k in SQLA_QUERY_KEYS
-            }
-            sqla_query = self.get_sqla_query(**cast(Any, filtered_query_obj))
-            extra_cache_keys += sqla_query.extra_cache_keys
+        execution_user = resolve_execution_user(self)
+        with (
+            execution_identity(execution_user)
+            if execution_user is not None
+            else nullcontext()
+        ):
+            extra_cache_keys = super().get_extra_cache_keys(query_obj)
+            if execution_user is not None:
+                extra_cache_keys.append(f"execution_user:{execution_user.id}")
+            if self.has_extra_cache_key_calls(query_obj):
+                # Filter out keys that aren't parameters to get_sqla_query
+                filtered_query_obj = {
+                    k: v for k, v in query_obj.items() if k in SQLA_QUERY_KEYS
+                }
+                sqla_query = self.get_sqla_query(**cast(Any, filtered_query_obj))
+                extra_cache_keys += sqla_query.extra_cache_keys
 
-        # For virtual datasets, include RLS predicates in the cache key
-        if self.is_virtual and self.sql:
-            default_schema = self.database.get_default_schema(self.catalog)
-            rls_predicates = collect_rls_predicates_for_sql(
-                self.sql,
-                self.database,
-                self.catalog,
-                self.schema or default_schema or "",
-                exclude_dataset_id=self.id,
-            )
-            # Add each predicate as a separate cache key component
-            extra_cache_keys.extend(rls_predicates)
+            # For virtual datasets, include RLS predicates in the cache key
+            if self.is_virtual and self.sql:
+                default_schema = self.database.get_default_schema(self.catalog)
+                rls_predicates = collect_rls_predicates_for_sql(
+                    self.sql,
+                    self.database,
+                    self.catalog,
+                    self.schema or default_schema or "",
+                    exclude_dataset_id=self.id,
+                )
+                # Add each predicate as a separate cache key component
+                extra_cache_keys.extend(rls_predicates)
 
-        return list(set(extra_cache_keys))
+            return list(set(extra_cache_keys))
 
     @property
     def quote_identifier(self) -> Callable[[str], str]:

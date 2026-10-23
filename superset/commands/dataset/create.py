@@ -18,15 +18,18 @@ import logging
 from functools import partial
 from typing import Any
 
+from flask import current_app as app
 from flask_appbuilder.models.sqla import Model
 from marshmallow import ValidationError
 
+from superset import is_feature_enabled
 from superset.commands.base import BaseCommand, CreateMixin
 from superset.commands.dataset.exceptions import (
     DatabaseNotFoundValidationError,
     DatasetCreateFailedError,
     DatasetDataAccessIsNotAllowed,
     DatasetExistsValidationError,
+    DatasetForbiddenError,
     DatasetInvalidError,
     DatasetSoftDeletedTwinExistsError,
     DatasetSqlRenderValidationError,
@@ -42,6 +45,7 @@ from superset.db_engine_specs.exceptions import (
     SupersetDBAPIOperationalError,
 )
 from superset.exceptions import (
+    DatasetExecutionUserInvalidError,
     OAuth2RedirectError,
     SupersetException,
     SupersetParseError,
@@ -55,6 +59,12 @@ from superset.models.helpers import (
 )
 from superset.sql.parse import process_jinja_sql, Table
 from superset.utils.decorators import on_error, transaction
+from superset.utils.execution_identity import (
+    can_assign_execution_user,
+    FEATURE_FLAG,
+    get_active_user,
+    supports_execution_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +72,7 @@ logger = logging.getLogger(__name__)
 class CreateDatasetCommand(CreateMixin, BaseCommand):
     def __init__(self, data: dict[str, Any]):
         self._properties = data.copy()
+        self._execution_user: str | None = None
 
     @transaction(on_error=partial(on_error, reraise=DatasetCreateFailedError))
     def run(self) -> Model:
@@ -100,6 +111,9 @@ class CreateDatasetCommand(CreateMixin, BaseCommand):
                     )
                 ]
             ) from ex
+        if self._execution_user:
+            dataset.set_execution_user_username(self._execution_user)
+            app.config["STATS_LOGGER"].incr("dataset.execution_user.set")
         return dataset
 
     def validate(self) -> None:  # noqa: C901
@@ -127,11 +141,15 @@ class CreateDatasetCommand(CreateMixin, BaseCommand):
                 template_params_valid = False
                 exceptions.append(TemplateParamsInvalidValidationError())
 
+        self._execution_user = self._properties.pop("execution_user", None)
+
         # Validate/Populate database
         database = DatasetDAO.get_database_by_id(database_id)
         if not database:
             exceptions.append(DatabaseNotFoundValidationError())
         self._properties["database"] = database
+
+        self._validate_execution_user(database, exceptions)
 
         # Validate uniqueness
         if database:
@@ -281,3 +299,31 @@ class CreateDatasetCommand(CreateMixin, BaseCommand):
 
         if exceptions:
             raise DatasetInvalidError(exceptions=exceptions)
+
+    def _validate_execution_user(
+        self, database: Any, exceptions: list[ValidationError]
+    ) -> None:
+        username = self._execution_user
+        if username is None:
+            return
+        if not is_feature_enabled(FEATURE_FLAG):
+            exceptions.append(
+                ValidationError(["Feature is not enabled"], field_name="execution_user")
+            )
+            return
+        if not can_assign_execution_user(username):
+            raise DatasetForbiddenError()
+        try:
+            get_active_user(username)
+        except DatasetExecutionUserInvalidError as ex:
+            exceptions.append(
+                ValidationError([ex.message], field_name="execution_user")
+            )
+            return
+        if database is not None and not supports_execution_user(database):
+            exceptions.append(
+                ValidationError(
+                    ["Database does not support OAuth2 user impersonation"],
+                    field_name="execution_user",
+                )
+            )

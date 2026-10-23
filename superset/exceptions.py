@@ -423,6 +423,24 @@ class OAuth2TokenRefreshError(OAuth2RedirectError):
         )
 
 
+class OAuth2TokenRefreshInProgressError(SupersetErrorException):
+    """
+    Raised when another worker holds the refresh lock and the token is still
+    being refreshed. This is transient, not a missing authorization.
+    """
+
+    status = 503
+
+    def __init__(self) -> None:
+        super().__init__(
+            SupersetError(
+                message=_("OAuth2 token refresh is in progress; retry the request."),
+                error_type=SupersetErrorType.GENERIC_BACKEND_ERROR,
+                level=ErrorLevel.WARNING,
+            )
+        )
+
+
 class OAuth2Error(SupersetErrorException):
     """
     Exception for when OAuth2 goes wrong.
@@ -458,6 +476,45 @@ class OAuth2RejectedError(SupersetErrorException):
                 message=error,
                 error_type=SupersetErrorType.OAUTH2_REDIRECT_ERROR,
                 level=ErrorLevel.WARNING,
+            )
+        )
+
+
+class DatasetExecutionUserError(SupersetErrorException):
+    status = 422
+
+
+class DatasetExecutionUserInvalidError(DatasetExecutionUserError):
+    def __init__(self, username: str):
+        super().__init__(
+            SupersetError(
+                message=_(
+                    "Dataset execution user %(username)s does not exist or is inactive",
+                    username=username,
+                ),
+                error_type=SupersetErrorType.DATASET_EXECUTION_USER_INVALID,
+                level=ErrorLevel.ERROR,
+                extra={"execution_user": username},
+            )
+        )
+
+
+class DatasetExecutionUserTokenMissingError(DatasetExecutionUserError):
+    def __init__(self, username: str, database_name: str):
+        super().__init__(
+            SupersetError(
+                message=_(
+                    "Dataset execution user %(username)s has not authorized "
+                    "database %(database)s",
+                    username=username,
+                    database=database_name,
+                ),
+                error_type=SupersetErrorType.DATASET_EXECUTION_USER_TOKEN_MISSING,
+                level=ErrorLevel.ERROR,
+                extra={
+                    "execution_user": username,
+                    "database": database_name,
+                },
             )
         )
 

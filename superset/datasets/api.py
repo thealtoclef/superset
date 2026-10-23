@@ -109,10 +109,12 @@ from superset.jinja_context import BaseTemplateProcessor, get_template_processor
 from superset.subjects.filters import FilterRelatedSubjects, subject_type_filter
 from superset.utils import json
 from superset.utils.core import (
+    get_username,
     parse_boolean_string,
     send_export_zip,
     write_zip_entry,
 )
+from superset.utils.oauth2 import has_stored_oauth2_token
 from superset.versioning.api_helpers import (
     concurrency_token_from,
     current_entity_version_info,
@@ -177,6 +179,8 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "restore_version": "write",
         "purge": "write",
         "purge_impact": "write",
+        "execution_user_status": "read",
+        "authorize_execution_user": "read",
     }
     include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {
         RouteMethod.EXPORT,
@@ -198,6 +202,8 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "get_version",
         "activity",
         "restore_version",
+        "execution_user_status",
+        "authorize_execution_user",
     }
     list_columns = [
         "id",
@@ -216,6 +222,7 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "datasource_type",
         "explore_url",
         "extra",
+        "execution_user",
         "kind",
         "editors.id",
         "editors.label",
@@ -322,6 +329,7 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "metrics.certified_by",
         "metrics.is_certified",
         "metrics.warning_markdown",
+        "execution_user",
         "is_managed_externally",
         "uid",
         "uuid",
@@ -342,6 +350,7 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "schema",
         "table_name",
         "sql",
+        "execution_user",
         "editors",
     ]
     edit_columns = [
@@ -361,6 +370,7 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
         "cache_timeout",
         "is_sqllab_view",
         "template_params",
+        "execution_user",
         "editors",
         "columns",
         "metrics",
@@ -549,6 +559,8 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
             raise
         except DatasetSoftDeletedTwinExistsError as ex:
             return self.response_422(message=str(ex))
+        except DatasetForbiddenError:
+            return self.response_403()
         except DatasetInvalidError as ex:
             return self.response_422(message=ex.normalized_messages())
         except DatasetCreateFailedError as ex:
@@ -1956,6 +1968,46 @@ class DatasetRestApi(SoftDeleteApiMixin, BaseSupersetModelRestApi):
             return self.response(200, result=result)
         except CommandException as ex:
             return self.response(ex.status, message=ex.message)
+
+    @expose("/<pk>/execution_user_status", methods=("GET",))
+    @protect()
+    @safe
+    @statsd_metrics
+    def execution_user_status(self, pk: int) -> Response:
+        dataset = DatasetDAO.find_by_id(pk)
+        if not dataset:
+            return self.response_404()
+        security_manager.raise_for_access(datasource=dataset)
+        username = dataset.get_execution_user_username()
+        if not username:
+            return self.response(200, execution_user=None, token_present=False)
+        user = security_manager.find_user(username=username)
+        return self.response(
+            200,
+            execution_user=username,
+            token_present=bool(
+                user and has_stored_oauth2_token(int(dataset.database.id), int(user.id))
+            ),
+        )
+
+    @expose("/<pk>/authorize_execution_user", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    def authorize_execution_user(self, pk: int) -> Response:
+        dataset = DatasetDAO.find_by_id(pk)
+        if not dataset:
+            return self.response_404()
+        username = dataset.get_execution_user_username()
+        if not username:
+            return self.response_400(message="Dataset has no execution user")
+        if get_username() != username:
+            return self.response_403()
+        try:
+            dataset.database.start_oauth2_dance()
+        except OAuth2RedirectError as ex:
+            return self.response(200, **(ex.error.extra or {}))
+        return self.response_400(message="OAuth2 is not configured")
 
     @expose("/<id_or_uuid>", methods=("GET",))
     @protect()

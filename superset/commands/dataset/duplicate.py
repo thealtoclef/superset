@@ -50,6 +50,7 @@ from superset.models.helpers import (
     template_params_for_access_check,
 )
 from superset.sql.parse import Table
+from superset.utils.core import get_user
 from superset.utils.decorators import on_error, transaction
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ class DuplicateDatasetCommand(CreateMixin, BaseCommand):
             )
         table = SqlaTable()
         table.override(self._base_model)
+        if get_user() is not None and not security_manager.is_admin():
+            table.set_execution_user_username(None)
         table.table_name = table_name
         table.editors = editors
         table.database = database

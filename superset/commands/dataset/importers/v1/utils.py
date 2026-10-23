@@ -52,7 +52,11 @@ from superset.commands.importers.v1.utils import (
 from superset.connectors.sqla.models import SqlaTable
 from superset.constants import SKIP_VISIBILITY_FILTER_CLASSES
 from superset.daos.dataset import DatasetDAO
-from superset.exceptions import SupersetParseError, SupersetSecurityException
+from superset.exceptions import (
+    DatasetExecutionUserInvalidError,
+    SupersetParseError,
+    SupersetSecurityException,
+)
 from superset.models.core import Database
 from superset.models.helpers import (
     ChildMultipleResultsFound,
@@ -63,6 +67,11 @@ from superset.models.helpers import (
 from superset.sql.parse import Table
 from superset.utils import json
 from superset.utils.core import get_user
+from superset.utils.execution_identity import (
+    can_assign_execution_user,
+    get_active_user,
+    supports_execution_user,
+)
 from superset.utils.network import is_safe_host, is_safe_ip
 
 logger = logging.getLogger(__name__)
@@ -393,6 +402,41 @@ def _raise_for_import_binding_access(
         )
 
 
+def sanitize_execution_user(config: dict[str, Any], ignore_permissions: bool) -> None:
+    extra = config.get("extra")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except json.JSONDecodeError:
+            return
+        config["extra"] = extra
+    if not isinstance(extra, dict) or "execution_user" not in extra:
+        return
+    username = extra.pop("execution_user")
+    if not isinstance(username, str):
+        return
+    if not (ignore_permissions or can_assign_execution_user(username)):
+        return
+    database = (
+        db.session.get(Database, config["database_id"])
+        if config.get("database_id")
+        else None
+    )
+    try:
+        get_active_user(username)
+    except DatasetExecutionUserInvalidError:
+        logger.warning("Dropping unknown dataset execution user %r on import", username)
+        return
+    if database is not None and supports_execution_user(database):
+        extra["execution_user"] = username
+    else:
+        logger.warning(
+            "Dropping dataset execution user %r: database does not support "
+            "OAuth2 impersonation",
+            username,
+        )
+
+
 def import_dataset(  # noqa: C901
     config: dict[str, Any],
     overwrite: bool = False,
@@ -625,6 +669,8 @@ def import_dataset(  # noqa: C901
             raise IncorrectFormatError(f"Invalid SQL: {ex.error.message}") from ex
         except TemplateError as ex:
             raise IncorrectFormatError(f"Invalid SQL: {ex}") from ex
+
+    sanitize_execution_user(config, ignore_permissions)
 
     # TODO (betodealmeida): move this logic to import_from_dict
     config = config.copy()

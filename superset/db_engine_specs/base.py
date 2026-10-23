@@ -838,6 +838,13 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         while the code_challenge (derived from the verifier) is sent to the
         authorization server.
         """
+        # pylint: disable=import-outside-toplevel
+        from superset.utils.execution_identity import (
+            raise_for_impersonated_execution,
+        )
+
+        raise_for_impersonated_execution(database)
+
         # Prevent circular import.
         from superset.daos.key_value import KeyValueDAO
 

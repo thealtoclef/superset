@@ -249,6 +249,11 @@ class QueryContextProcessor:
         self, query_obj: QueryObject, force_cached: bool | None = False
     ) -> QueryAcquisitionResult:
         """Acquire a dataframe and return timing as a typed sidecar."""
+        # pylint: disable=import-outside-toplevel
+        from superset.utils.execution_identity import resolve_execution_user
+        from superset.utils.oauth2 import has_stored_oauth2_token
+
+        execution_user = resolve_execution_user(self._qc_datasource)
         query_planning_start_ns = time.perf_counter_ns()
         if query_obj:
             # Always validate the query object before generating cache key
@@ -260,6 +265,12 @@ class QueryContextProcessor:
         force_query = (
             self._resolve_forced_query(query_obj, cache_key)
             or timeout == CACHE_DISABLED_TIMEOUT
+            or (
+                execution_user is not None
+                and not has_stored_oauth2_token(
+                    self._qc_datasource.database.id, execution_user.id
+                )
+            )
         )
         query_planning_ns = max(0, time.perf_counter_ns() - query_planning_start_ns)
 

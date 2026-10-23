@@ -75,6 +75,7 @@ export type DatasetObject = {
   columns: ColumnObject[];
   metrics: MetricObject[];
   extra?: string;
+  execution_user?: string | null;
   certified_by?: string;
   certification_details?: string;
   dataset_certification_changed?: boolean;

@@ -789,3 +789,66 @@ def test_get_dataset_exposes_certification_metadata(
         assert item["certified_by"] == "Data Platform"
         assert item["certification_details"] == "Reviewed quarterly"
         assert item["warning_markdown"] == "This is a **warning**"
+
+
+def test_execution_user_status_without_setting(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.models.core import Database
+
+    SqlaTable.metadata.create_all(db.session.get_bind())
+    database = Database(database_name="status_db", sqlalchemy_uri="sqlite://")
+    dataset = SqlaTable(table_name="status_dataset", database=database)
+    db.session.add(dataset)
+    db.session.flush()
+
+    response = client.get(f"/api/v1/dataset/{dataset.id}/execution_user_status")
+
+    assert response.status_code == 200
+    assert response.json == {"execution_user": None, "token_present": False}
+
+
+def test_execution_user_status_reports_setting(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.models.core import Database
+
+    SqlaTable.metadata.create_all(db.session.get_bind())
+    database = Database(database_name="status_db_2", sqlalchemy_uri="sqlite://")
+    dataset = SqlaTable(
+        table_name="status_dataset_2",
+        database=database,
+        extra='{"execution_user": "alice"}',
+    )
+    db.session.add(dataset)
+    db.session.flush()
+
+    response = client.get(f"/api/v1/dataset/{dataset.id}/execution_user_status")
+
+    assert response.status_code == 200
+    assert response.json == {"execution_user": "alice", "token_present": False}
+
+
+def test_authorize_execution_user_without_setting(
+    session: Session,
+    client: Any,
+    full_api_access: None,
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.models.core import Database
+
+    SqlaTable.metadata.create_all(db.session.get_bind())
+    database = Database(database_name="authorize_db", sqlalchemy_uri="sqlite://")
+    dataset = SqlaTable(table_name="authorize_dataset", database=database)
+    db.session.add(dataset)
+    db.session.flush()
+
+    response = client.post(f"/api/v1/dataset/{dataset.id}/authorize_execution_user")
+
+    assert response.status_code == 400

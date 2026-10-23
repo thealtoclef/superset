@@ -33,9 +33,12 @@ from sqlalchemy.pool import StaticPool
 
 from superset.db_engine_specs.base import BaseEngineSpec
 from superset.exceptions import (
+    AcquireDistributedLockFailedException,
+    DatasetExecutionUserTokenMissingError,
     OAuth2Error,
     OAuth2RedirectError,
     OAuth2TokenRefreshError,
+    OAuth2TokenRefreshInProgressError,
 )
 from superset.superset_typing import OAuth2ClientConfig
 from superset.utils.oauth2 import (
@@ -543,6 +546,7 @@ def test_refresh_oauth2_token_no_access_token_in_response(
     result = refresh_oauth2_token(DUMMY_OAUTH2_CONFIG, 1, 1, db_engine_spec)
 
     assert result is None
+    db.session.delete.assert_called_once_with(token)
 
 
 def test_refresh_oauth2_token_updates_refresh_token(
@@ -907,3 +911,104 @@ def test_get_oauth2_redirect_uri_raises_on_runtime_error(
     )
     with pytest.raises(OAuth2Error):
         get_oauth2_redirect_uri()
+
+
+def test_execute_with_oauth2_retry_without_config_skips_lookup(
+    mocker: MockerFixture,
+) -> None:
+    database = mocker.MagicMock()
+    database.get_oauth2_config.return_value = None
+    operation = mocker.Mock(return_value="ok")
+
+    assert execute_with_oauth2_retry(database, operation) == "ok"
+
+    database.db_engine_spec.needs_oauth2.assert_not_called()
+
+
+def test_execute_with_oauth2_retry_blocks_viewer_owner_refresh(
+    mocker: MockerFixture,
+) -> None:
+    db = mocker.patch("superset.utils.oauth2.db")
+    db.session.query().filter_by().one_or_none.return_value = None
+    database = mocker.MagicMock()
+    database.id = 1
+    database.name = "my_db"
+    database.get_oauth2_config.return_value = {}
+    database.db_engine_spec.needs_oauth2.return_value = True
+    execution_user = mocker.MagicMock(id=42, username="alice")
+    mocker.patch(
+        "superset.utils.oauth2.g",
+        mocker.MagicMock(user=mocker.MagicMock(id=7)),
+    )
+    operation = mocker.Mock(side_effect=OAuth2Error("auth"))
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        execute_with_oauth2_retry(database, operation, execution_user=execution_user)
+
+    assert operation.call_count == 1
+    database.start_oauth2_dance.assert_not_called()
+
+
+def test_execute_with_oauth2_retry_owner_refresh_rejected(
+    mocker: MockerFixture,
+) -> None:
+    db = mocker.patch("superset.utils.oauth2.db")
+    db.session.query().filter_by().one_or_none.return_value = None
+    database = mocker.MagicMock(id=1, name="my_db")
+    database.get_oauth2_config.return_value = {}
+    database.db_engine_spec.needs_oauth2.return_value = True
+    execution_user = mocker.MagicMock(id=42, username="alice")
+    mocker.patch(
+        "superset.utils.oauth2.g",
+        mocker.MagicMock(user=mocker.MagicMock(id=42)),
+    )
+    mocker.patch(
+        "superset.utils.oauth2.refresh_oauth2_token",
+        side_effect=OAuth2TokenRefreshError(),
+    )
+    operation = mocker.Mock(side_effect=OAuth2Error("auth"))
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        execute_with_oauth2_retry(database, operation, execution_user=execution_user)
+
+    assert operation.call_count == 1
+    database.start_oauth2_dance.assert_not_called()
+
+
+def test_execute_with_oauth2_retry_owner_lock_contention(
+    mocker: MockerFixture,
+) -> None:
+    db = mocker.patch("superset.utils.oauth2.db")
+    db.session.query().filter_by().one_or_none.return_value = None
+    database = mocker.MagicMock(id=1, name="my_db")
+    database.get_oauth2_config.return_value = {}
+    database.db_engine_spec.needs_oauth2.return_value = True
+    execution_user = mocker.MagicMock(id=42, username="alice")
+    mocker.patch(
+        "superset.utils.oauth2.g",
+        mocker.MagicMock(user=mocker.MagicMock(id=42)),
+    )
+    mocker.patch(
+        "superset.utils.oauth2.refresh_oauth2_token",
+        side_effect=AcquireDistributedLockFailedException("busy"),
+    )
+    operation = mocker.Mock(side_effect=OAuth2Error("auth"))
+
+    with pytest.raises(OAuth2TokenRefreshInProgressError):
+        execute_with_oauth2_retry(database, operation, execution_user=execution_user)
+
+    assert operation.call_count == 1
+    database.start_oauth2_dance.assert_not_called()
+
+
+def test_check_for_oauth2_converts_owner_refresh_error(
+    mocker: MockerFixture,
+) -> None:
+    database = mocker.MagicMock(name="my_db")
+    execution_user = mocker.MagicMock(username="alice")
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        with check_for_oauth2(database, execution_user):
+            raise OAuth2TokenRefreshError()
+
+    database.db_engine_spec.start_oauth2_dance.assert_not_called()

@@ -192,6 +192,10 @@ const DatasourceModal: FunctionComponent<DatasourceModalProps> = ({
         datasource.cache_timeout === '' ? null : datasource.cache_timeout,
       is_sqllab_view: datasource.is_sqllab_view,
       template_params: datasource.template_params,
+      ...(isFeatureEnabled(FeatureFlag.DatasetExecutionUser) &&
+      datasource.execution_user !== undefined
+        ? { execution_user: datasource.execution_user ?? null }
+        : {}),
       extra: datasource.dataset_certification_changed
         ? setDatasetCertification(datasource.extra, {
             certified_by: datasource.certified_by,

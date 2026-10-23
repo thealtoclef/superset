@@ -2540,6 +2540,7 @@ def test_gauge_query_restores_long_sql_metric_label(mocker: MockerFixture) -> No
         catalog: str,
         schema: str,
         mutator: Callable[[pd.DataFrame], pd.DataFrame],
+        execution_user=None,
     ) -> pd.DataFrame:
         """Apply the real query result relabeling callback to driver output."""
         return mutator(pd.DataFrame({"truncated": [42]}))

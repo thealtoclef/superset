@@ -69,7 +69,12 @@ from superset.constants import LRU_CACHE_MAX_SIZE, PASSWORD_MASK
 from superset.databases.error_provenance import mark_database_engine_error
 from superset.databases.utils import make_url_safe
 from superset.db_engine_specs.base import MetricType, TimeGrain
-from superset.exceptions import SupersetGenericDBErrorException
+from superset.exceptions import (
+    DatasetExecutionUserTokenMissingError,
+    OAuth2TokenRefreshError,
+    OAuth2TokenRefreshInProgressError,
+    SupersetGenericDBErrorException,
+)
 from superset.extensions import (
     cache_manager,
     encrypted_field_factory,
@@ -89,9 +94,16 @@ from superset.utils import cache as cache_util, core as utils, json
 from superset.utils.backports import StrEnum
 from superset.utils.core import get_query_source_from_request, get_username
 from superset.utils.database import find_user_for_impersonation
+from superset.utils.execution_identity import (
+    execution_identity,
+    get_execution_user,
+    raise_for_impersonated_execution,
+)
 from superset.utils.oauth2 import (
     check_for_oauth2,
+    execute_with_oauth2_retry,
     get_oauth2_access_token,
+    has_stored_oauth2_token,
     OAuth2ClientConfigSchema,
 )
 
@@ -104,10 +116,11 @@ logger = logging.getLogger(__name__)
 # access. Cache is per-process, per-(URL + final engine_kwargs), so a
 # password rotation, host change, or DB_CONNECTION_MUTATOR producing
 # different kwargs naturally falls through to a fresh engine.
-_ENGINE_CACHE: dict[tuple[int, str, str], Engine] = {}
+_ENGINE_CACHE: dict[tuple[int, str, str, int | None], Engine] = {}
 _ENGINE_CACHE_LOCK = threading.Lock()
 
 if TYPE_CHECKING:
+    from flask_appbuilder.security.sqla.models import User
     from superset_core.queries.types import AsyncQueryHandle, QueryOptions, QueryResult
 
     from superset.models.sql_lab import Query
@@ -523,13 +536,23 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         # render_as_string(hide_password=False) is required here.
         self.sqlalchemy_uri = conn.render_as_string(hide_password=False)
 
-    def get_effective_user(self, object_url: URL) -> str | None:
+    def get_effective_user(
+        self,
+        object_url: URL,
+        execution_user: User | None = None,
+    ) -> str | None:
         """
         Get the effective user, especially during impersonation.
 
         :param object_url: SQL Alchemy URL object
+        :param execution_user: Dataset execution identity, when configured
         :return: The effective username
         """
+
+        if execution_user is None:
+            execution_user = get_execution_user()
+        if execution_user is not None:
+            return execution_user.username
 
         return (
             username
@@ -539,7 +562,11 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
             else None
         )
 
-    def get_impersonation_email(self, object_url: URL | None = None) -> str | None:
+    def get_impersonation_email(
+        self,
+        object_url: URL | None = None,
+        execution_user: User | None = None,
+    ) -> str | None:
         """
         Get the email address of the user being impersonated.
 
@@ -551,9 +578,15 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
 
         :param object_url: URL to read the login from; defaults to this
             database's own URL
+        :param execution_user: Dataset execution identity, when configured
         :return: The impersonated user's email, or ``None`` if there is no
             effective user or the login has no email on record
         """
+        if execution_user is None:
+            execution_user = get_execution_user()
+        if execution_user is not None:
+            return execution_user.email or None
+
         username = self.get_effective_user(object_url or self.url_object)
         if not username:
             return None
@@ -561,7 +594,11 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         user = find_user_for_impersonation(username)
         return user.email if user and user.email else None
 
-    def get_impersonation_username(self, object_url: URL | None = None) -> str | None:
+    def get_impersonation_username(
+        self,
+        object_url: URL | None = None,
+        execution_user: User | None = None,
+    ) -> str | None:
         """
         Get the username to impersonate on the analytic database.
 
@@ -572,14 +609,17 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
 
         :param object_url: URL to read the login from; defaults to this
             database's own URL
+        :param execution_user: Dataset execution identity, when configured
         :return: The username to connect as, or ``None`` if there is no
             effective user
         """
-        username = self.get_effective_user(object_url or self.url_object)
+        username = self.get_effective_user(
+            object_url or self.url_object, execution_user
+        )
         if not username or not is_feature_enabled("IMPERSONATE_WITH_EMAIL_PREFIX"):
             return username
 
-        email = self.get_impersonation_email(object_url)
+        email = self.get_impersonation_email(object_url, execution_user)
         return email.split("@")[0] if email else username
 
     @contextmanager
@@ -589,6 +629,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         schema: str | None = None,
         nullpool: bool = True,
         source: utils.QuerySource | None = None,
+        execution_user: User | None = None,
     ) -> Engine:
         """
         Context manager for a SQLAlchemy engine.
@@ -598,7 +639,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         to potentially establish SSH tunnels before the connection is created, and clean
         them up once the engine is no longer used.
         """
-
+        execution_user = execution_user or get_execution_user()
         sqlalchemy_uri = self.sqlalchemy_uri_decrypted
 
         ssh_context_manager = (
@@ -626,7 +667,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
 
             engine_context_manager = app.config["ENGINE_CONTEXT_MANAGER"]
             with engine_context_manager(self, catalog, schema):
-                with check_for_oauth2(self):
+                with check_for_oauth2(self, execution_user):
                     prequeries = self.db_engine_spec.get_prequeries(
                         database=self,
                         catalog=catalog,
@@ -640,14 +681,20 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
                     # mutated during iteration", surfacing as 500s). Request a
                     # private, uncached engine whenever prequeries are present
                     # so the listener add/remove never touches a shared object.
-                    engine = self._get_sqla_engine(
-                        catalog=catalog,
-                        schema=schema,
-                        nullpool=nullpool,
-                        source=source,
-                        sqlalchemy_uri=sqlalchemy_uri,
-                        cacheable=not prequeries,
-                    )
+                    with (
+                        execution_identity(execution_user)
+                        if execution_user is not None
+                        else nullcontext()
+                    ):
+                        engine = self._get_sqla_engine(
+                            catalog=catalog,
+                            schema=schema,
+                            nullpool=nullpool,
+                            source=source,
+                            sqlalchemy_uri=sqlalchemy_uri,
+                            cacheable=not prequeries,
+                            execution_user=execution_user,
+                        )
                     if prequeries:
                         # SQLAlchemy connect event: runs prequeries on every new
                         # DBAPI connection (e.g. SET search_path for PostgreSQL).
@@ -686,7 +733,9 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         source: utils.QuerySource | None = None,
         sqlalchemy_uri: str | None = None,
         cacheable: bool = True,
+        execution_user: User | None = None,
     ) -> Engine:
+        execution_user = execution_user or get_execution_user()
         sqlalchemy_url = make_url_safe(
             sqlalchemy_uri if sqlalchemy_uri else self.sqlalchemy_uri_decrypted
         )
@@ -707,19 +756,44 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         )
         engine_kwargs["connect_args"] = connect_args
 
-        effective_username = self.get_impersonation_username(sqlalchemy_url)
+        effective_username = self.get_impersonation_username(
+            sqlalchemy_url, execution_user
+        )
 
         oauth2_config = self.get_oauth2_config()
-        access_token = (
-            get_oauth2_access_token(
-                oauth2_config,
-                self.id,
-                g.user.id,
-                self.db_engine_spec,
+        if execution_user is not None:
+            user_id = execution_user.id
+        else:
+            user_id = getattr(getattr(g, "user", None), "id", None)
+        try:
+            access_token = (
+                get_oauth2_access_token(
+                    oauth2_config,
+                    self.id,
+                    user_id,
+                    self.db_engine_spec,
+                    durable=execution_user is not None,
+                )
+                if oauth2_config and user_id is not None
+                else None
             )
-            if oauth2_config and hasattr(g, "user") and hasattr(g.user, "id")
-            else None
-        )
+        except OAuth2TokenRefreshError:
+            if execution_user is not None and self.impersonate_user and oauth2_config:
+                raise DatasetExecutionUserTokenMissingError(
+                    execution_user.username, self.name
+                ) from None
+            raise
+        if (
+            execution_user is not None
+            and self.impersonate_user
+            and oauth2_config
+            and access_token is None
+        ):
+            if has_stored_oauth2_token(self.id, user_id):
+                raise OAuth2TokenRefreshInProgressError()
+            raise DatasetExecutionUserTokenMissingError(
+                execution_user.username, self.name
+            )
         masked_url = self.get_password_masked_url(sqlalchemy_url)
         logger.debug("Database._get_sqla_engine(). Masked URL: %s", str(masked_url))
 
@@ -760,7 +834,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         # prequeries) pass ``cacheable=False`` for a private engine: listener
         # registration on a shared engine races with concurrent connection
         # checkouts iterating the same unlocked listener deque.
-        cache_key: tuple[int, str, str] | None = None
+        cache_key: tuple[int, str, str, int | None] | None = None
         if cacheable and self.id is not None:
             cache_key = (
                 self.id,
@@ -773,6 +847,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
                 # is required to preserve that behavior.
                 sqlalchemy_url.render_as_string(hide_password=False),
                 repr(sorted(engine_kwargs.items())),
+                execution_user.id if execution_user is not None else None,
             )
             with _ENGINE_CACHE_LOCK:
                 if cached := _ENGINE_CACHE.get(cache_key):
@@ -813,14 +888,16 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         schema: str | None = None,
         nullpool: bool = True,
         source: utils.QuerySource | None = None,
+        execution_user: User | None = None,
     ) -> Connection:
         with self.get_sqla_engine(
             catalog=catalog,
             schema=schema,
             nullpool=nullpool,
             source=source,
+            execution_user=execution_user,
         ) as engine:
-            with check_for_oauth2(self):
+            with check_for_oauth2(self, execution_user):
                 with closing(engine.raw_connection()) as conn:
                     yield conn
 
@@ -944,6 +1021,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         catalog: str | None = None,
         schema: str | None = None,
         fetch_last_result: bool = False,
+        execution_user: User | None = None,
     ) -> tuple[Any, list[tuple[Any, ...]] | None, DbapiDescription | None]:
         """
         Internal method to execute SQL with mutation and logging.
@@ -952,15 +1030,19 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         :param catalog: Optional catalog name
         :param schema: Optional schema name
         :param fetch_last_result: Whether to fetch results from last statement
+        :param execution_user: Dataset execution identity, when configured
         :return: Tuple of (cursor, rows, description) where rows and description
         are None if not fetching.
         """
         script = SQLScript(sql, self.db_engine_spec.engine)
 
-        with self.get_sqla_engine(catalog=catalog, schema=schema) as engine:
+        with self.get_sqla_engine(
+            catalog=catalog, schema=schema, execution_user=execution_user
+        ) as engine:
             engine_url = engine.url
 
         log_query = app.config["QUERY_LOGGER"]
+        progressed = False
 
         def _log_query(sql_: str) -> None:
             if log_query:
@@ -972,52 +1054,74 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
                     security_manager,
                 )
 
-        with self.get_raw_connection(catalog=catalog, schema=schema) as conn:
-            cursor = conn.cursor()
-            rows = None
-            description = None
+        def _run() -> tuple[Any, list[tuple[Any, ...]] | None, DbapiDescription | None]:
+            nonlocal progressed
+            with self.get_raw_connection(
+                catalog=catalog, schema=schema, execution_user=execution_user
+            ) as conn:
+                cursor = conn.cursor()
+                rows = None
+                description = None
 
-            # Give an active GTF chart-data task a chance to capture an engine
-            # cancel id off the live cursor before the (blocking) execute below,
-            # so a concurrent abort/timeout can kill the query. No-op otherwise.
-            from superset.tasks.query_cancel import notify_cursor
+                # Give an active GTF chart-data task a chance to capture an engine
+                # cancel id off the live cursor before the (blocking) execute below,
+                # so a concurrent abort/timeout can kill the query. No-op otherwise.
+                from superset.tasks.query_cancel import notify_cursor
 
-            notify_cursor(cursor)
+                notify_cursor(cursor)
 
-            for i, statement in enumerate(script.statements):
-                # For a single statement, execute the original SQL as-is. Re-rendering
-                # via statement.format() would round-trip through sqlglot
-                rendered = sql if len(script.statements) == 1 else statement.format()
-                sql_ = self.mutate_sql_based_on_config(
-                    rendered,
-                    is_split=True,
-                )
-                _log_query(sql_)
+                for i, statement in enumerate(script.statements):
+                    # For a single statement, execute the original SQL as-is.
+                    # Re-rendering via statement.format() would round-trip through
+                    # sqlglot.
+                    rendered = (
+                        sql if len(script.statements) == 1 else statement.format()
+                    )
+                    sql_ = self.mutate_sql_based_on_config(
+                        rendered,
+                        is_split=True,
+                    )
+                    _log_query(sql_)
 
-                with event_logger.log_context(
-                    action="execute_sql",
-                    database=self,
-                    object_ref=__name__,
-                ):
-                    self.db_engine_spec.execute(cursor, sql_, self)
+                    with event_logger.log_context(
+                        action="execute_sql",
+                        database=self,
+                        object_ref=__name__,
+                    ):
+                        self.db_engine_spec.execute(cursor, sql_, self)
+                    progressed = True
 
-                # Fetch results from last statement if requested
-                if fetch_last_result and i == len(script.statements) - 1:
-                    rows = self.db_engine_spec.fetch_data(cursor)
-                    # Some asynchronous DB-API drivers expose placeholder metadata
-                    # until fetching waits for the operation to finish.
-                    description = cursor.description
-                else:
-                    # Consume results without storing
-                    cursor.fetchall()
+                    # Fetch results from last statement if requested
+                    if fetch_last_result and i == len(script.statements) - 1:
+                        rows = self.db_engine_spec.fetch_data(cursor)
+                        # Some asynchronous DB-API drivers expose placeholder
+                        # metadata until fetching waits for the operation to
+                        # finish.
+                        description = cursor.description
+                    else:
+                        # Consume results without storing
+                        cursor.fetchall()
 
-            return cursor, rows, description
+                return cursor, rows, description
+
+        with (
+            execution_identity(execution_user)
+            if execution_user is not None
+            else nullcontext()
+        ):
+            return execute_with_oauth2_retry(
+                self,
+                _run,
+                can_retry=lambda: not progressed,
+                execution_user=execution_user,
+            )
 
     def execute_sql_statements(
         self,
         sql: str,
         catalog: str | None = None,
         schema: str | None = None,
+        execution_user: User | None = None,
     ) -> None:
         """
         Execute SQL statements with proper logging and mutation.
@@ -1037,7 +1141,11 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         :raises: Any database execution errors will be propagated
         """
         self._execute_sql_with_mutation_and_logging(
-            sql, catalog, schema, fetch_last_result=False
+            sql,
+            catalog,
+            schema,
+            fetch_last_result=False,
+            execution_user=execution_user,
         )
 
     def get_df(
@@ -1046,10 +1154,21 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         catalog: str | None = None,
         schema: str | None = None,
         mutator: Callable[[pd.DataFrame], None] | None = None,
+        execution_user: User | None = None,
     ) -> pd.DataFrame:
-        cursor, rows, description = self._execute_sql_with_mutation_and_logging(
-            sql, catalog, schema, fetch_last_result=True
+        context = (
+            execution_identity(execution_user)
+            if execution_user is not None
+            else nullcontext()
         )
+        with context:
+            cursor, rows, description = self._execute_sql_with_mutation_and_logging(
+                sql,
+                catalog,
+                schema,
+                fetch_last_result=True,
+                execution_user=execution_user,
+            )
 
         df = None
         if rows is not None:
@@ -1579,6 +1698,7 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         configured to use OAuth2 for authentication. It raises an exception that will
         trigger the OAuth2 dance in the frontend.
         """
+        raise_for_impersonated_execution(self)
         return self.db_engine_spec.start_oauth2_dance(self)
 
     def _handle_oauth2_error(self, ex: Exception) -> None:

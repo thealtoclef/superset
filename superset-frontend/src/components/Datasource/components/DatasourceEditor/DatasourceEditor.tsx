@@ -71,6 +71,8 @@ import {
   Loading,
   Row,
   Select,
+  Switch,
+  AsyncSelect,
   Tooltip,
   Typography,
   Label,
@@ -113,6 +115,14 @@ import {
   getDatasetCertification,
   isDatasetExtraValid,
 } from './datasetCertification';
+import { isUserAdmin } from 'src/dashboard/util/permissionUtils';
+import type { UserWithPermissionsAndRoles } from 'src/types/bootstrapTypes';
+import {
+  authorizeExecutionUser,
+  fetchExecutionUserOptions,
+  fetchExecutionUserStatus,
+  type ExecutionUserStatus,
+} from 'src/features/datasets/executionUser';
 
 const extensionsRegistry = getExtensionsRegistry();
 
@@ -189,6 +199,7 @@ interface DatasourceObject {
   description?: string;
   default_endpoint?: string;
   extra?: string;
+  execution_user?: string | null;
   certified_by?: string;
   certification_details?: string;
   dataset_certification_changed?: boolean;
@@ -292,6 +303,7 @@ interface DatabaseState {
 
 interface RootState {
   database?: DatabaseState;
+  user?: UserWithPermissionsAndRoles;
 }
 
 interface ChartUsageData {
@@ -945,6 +957,7 @@ const mapDispatchToProps = (
 
 const mapStateToProps = (state: RootState) => ({
   database: state?.database,
+  user: state?.user,
 });
 
 const connector = connect(mapStateToProps, mapDispatchToProps);
@@ -959,6 +972,7 @@ function DatasourceEditor({
   addDangerToast,
   setIsEditing = () => {},
   database,
+  user,
   runQuery,
   resetQuery,
   formatQuery: formatQueryAction,
@@ -1025,6 +1039,82 @@ function DatasourceEditor({
   const [columnSearchTerm, setColumnSearchTerm] = useState('');
   const [calculatedColumnSearchTerm, setCalculatedColumnSearchTerm] =
     useState('');
+  const isAdmin = isUserAdmin(user);
+  const executionUserFeatureEnabled = isFeatureEnabled(
+    FeatureFlag.DatasetExecutionUser,
+  );
+  const [executionMode, setExecutionMode] = useState<'viewer' | 'user'>(
+    datasource.execution_user ? 'user' : 'viewer',
+  );
+  const [tokenStatus, setTokenStatus] = useState<ExecutionUserStatus | null>(
+    null,
+  );
+  const [isAuthorizing, setIsAuthorizing] = useState(false);
+  const tokenStatusRequestId = useRef(0);
+  const initialExecutionUser = useRef(propsDatasource.execution_user ?? null);
+
+  const refreshTokenStatus = useCallback(async () => {
+    tokenStatusRequestId.current += 1;
+    const requestId = tokenStatusRequestId.current;
+    if (!executionUserFeatureEnabled || !datasource.id) {
+      setTokenStatus(null);
+      return;
+    }
+    try {
+      const status = await fetchExecutionUserStatus(datasource.id);
+      if (requestId === tokenStatusRequestId.current) {
+        setTokenStatus(status);
+      }
+    } catch {
+      if (requestId === tokenStatusRequestId.current) {
+        setTokenStatus(null);
+      }
+    }
+  }, [datasource.id, executionUserFeatureEnabled]);
+
+  useEffect(() => {
+    refreshTokenStatus();
+  }, [refreshTokenStatus]);
+
+  useEffect(() => {
+    window.addEventListener('focus', refreshTokenStatus);
+    return () => window.removeEventListener('focus', refreshTokenStatus);
+  }, [refreshTokenStatus]);
+
+  const handleAuthorizeExecutionUser = useCallback(async () => {
+    if (!datasource.id) {
+      return;
+    }
+    const popup = window.open('', '_blank');
+    setIsAuthorizing(true);
+    try {
+      const authorization = await authorizeExecutionUser(datasource.id);
+      if (popup) {
+        popup.opener = null;
+        popup.location.href = authorization.url;
+      } else {
+        window.location.assign(authorization.url);
+      }
+    } catch (error) {
+      popup?.close();
+      const { error: message } = await getClientErrorObject(error);
+      addDangerToast(message || t('Unable to start authorization'));
+    } finally {
+      setIsAuthorizing(false);
+    }
+  }, [datasource.id, addDangerToast]);
+
+  const statusMatches =
+    tokenStatus?.execution_user === (datasource.execution_user ?? null);
+  const tokenPresent = statusMatches ? tokenStatus?.token_present : null;
+  const executionUserChanged =
+    tokenStatus !== null &&
+    !statusMatches &&
+    Boolean(datasource.execution_user);
+  const restoreExecutionUser =
+    initialExecutionUser.current === user?.username
+      ? null
+      : (initialExecutionUser.current ?? null);
 
   const findDuplicates = useCallback(
     <T,>(arr: T[], accessor: (obj: T) => string): string[] => {
@@ -1858,9 +1948,133 @@ function DatasourceEditor({
             }
           />
         )}
+        {executionUserFeatureEnabled && isSqla && datasource.id && (
+          <div data-test="execution-user">
+            <FormLabel>{t('Run as')}</FormLabel>
+            {isAdmin ? (
+              <>
+                <Select
+                  value={executionMode}
+                  aria-label={t('Run as')}
+                  options={[
+                    { value: 'viewer', label: t('Viewer') },
+                    { value: 'user', label: t('Specific user') },
+                  ]}
+                  onChange={value => {
+                    const mode = value as 'viewer' | 'user';
+                    setExecutionMode(mode);
+                    if (mode === 'viewer') {
+                      onDatasourcePropChange('execution_user', null);
+                    }
+                  }}
+                />
+                {executionMode === 'user' && (
+                  <AsyncSelect
+                    value={datasource.execution_user ?? undefined}
+                    options={fetchExecutionUserOptions}
+                    placeholder={t('Select a user')}
+                    aria-label={t('Select a user')}
+                    onChange={value =>
+                      onDatasourcePropChange('execution_user', value ?? null)
+                    }
+                  />
+                )}
+              </>
+            ) : (
+              <Flex gap={8} align="center">
+                <Switch
+                  checked={
+                    Boolean(datasource.execution_user) &&
+                    datasource.execution_user === user?.username
+                  }
+                  disabled={!user?.username}
+                  aria-label={t('Use my database credentials')}
+                  onChange={checked =>
+                    onDatasourcePropChange(
+                      'execution_user',
+                      checked ? (user?.username ?? null) : restoreExecutionUser,
+                    )
+                  }
+                />
+                <Typography.Text>
+                  {t('Use my database credentials')}
+                </Typography.Text>
+              </Flex>
+            )}
+            {!isAdmin &&
+              datasource.execution_user &&
+              datasource.execution_user !== user?.username && (
+                <Alert
+                  type="info"
+                  showIcon
+                  title={t(
+                    'Currently runs as %s. Enabling this switch runs the dataset with your credentials instead.',
+                    datasource.execution_user,
+                  )}
+                />
+              )}
+            {executionUserChanged && (
+              <Alert
+                type="info"
+                showIcon
+                title={t(
+                  'Save the dataset to check whether %s has authorized this database.',
+                  datasource.execution_user,
+                )}
+              />
+            )}
+            {datasource.execution_user && (
+              <>
+                <Alert
+                  type="warning"
+                  showIcon
+                  title={t(
+                    'Everyone who can query this dataset sees the data %s can see. Superset RLS still applies per viewer.',
+                    datasource.execution_user,
+                  )}
+                />
+                {statusMatches && tokenPresent === false && (
+                  <>
+                    <Alert
+                      type="error"
+                      showIcon
+                      title={t(
+                        '%s has not authorized this database.',
+                        datasource.execution_user,
+                      )}
+                    />
+                    {user?.username === datasource.execution_user && (
+                      <Button
+                        buttonSize="small"
+                        loading={isAuthorizing}
+                        onClick={handleAuthorizeExecutionUser}
+                      >
+                        {t('Authorize database')}
+                      </Button>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </Fieldset>
     ),
-    [datasource, onDatasourcePropChange, isSqla],
+    [
+      datasource,
+      onDatasourcePropChange,
+      isSqla,
+      executionUserFeatureEnabled,
+      executionMode,
+      tokenPresent,
+      statusMatches,
+      executionUserChanged,
+      restoreExecutionUser,
+      isAdmin,
+      user,
+      isAuthorizing,
+      handleAuthorizeExecutionUser,
+    ],
   );
 
   const renderAdvancedFieldset = useCallback(

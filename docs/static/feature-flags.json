@@ -28,6 +28,12 @@
         "description": "Experimental PyArrow engine for CSV parsing (may have issues with dates/nulls)"
       },
       {
+        "name": "DATASET_EXECUTION_USER",
+        "default": false,
+        "lifecycle": "development",
+        "description": "Run dataset queries with the database credentials of a designated user instead of the viewer; RLS and dataset access stay viewer-based"
+      },
+      {
         "name": "DATASET_FOLDERS",
         "default": false,
         "lifecycle": "development",

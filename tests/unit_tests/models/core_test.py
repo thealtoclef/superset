@@ -17,6 +17,7 @@
 
 # pylint: disable=import-outside-toplevel
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import numpy
@@ -42,13 +43,17 @@ from superset.connectors.sqla.models import SqlaTable, TableColumn
 from superset.databases.error_provenance import mark_database_engine_error
 from superset.errors import SupersetErrorType
 from superset.exceptions import (
+    DatasetExecutionUserTokenMissingError,
     OAuth2Error,
     OAuth2RedirectError,
+    OAuth2TokenRefreshError,
+    OAuth2TokenRefreshInProgressError,
     SupersetGenericDBErrorException,
 )
 from superset.models.core import Database
 from superset.sql.parse import LimitMethod, Table
 from superset.utils import json
+from superset.utils.execution_identity import execution_identity
 from tests.unit_tests.conftest import with_feature_flags
 
 # sample config for OAuth2 tests
@@ -935,6 +940,197 @@ def test_get_impersonation_username_without_email(mocker: MockerFixture) -> None
     assert database.get_impersonation_email() is None
 
 
+def test_get_sqla_engine_execution_user(mocker: MockerFixture) -> None:
+    from superset.models.core import _ENGINE_CACHE
+
+    _ENGINE_CACHE.clear()
+    user = SimpleNamespace(id=42, username="alice", email="alice@example.org")
+    get_token = mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        return_value="token",
+    )
+    create_engine_mock = mocker.patch(
+        "superset.models.core.create_engine",
+        return_value=create_engine("sqlite://"),
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    database.id = 1
+    config = {"id": "client"}
+    mocker.patch.object(database, "get_oauth2_config", return_value=config)
+
+    database._get_sqla_engine(nullpool=False, execution_user=user)
+
+    get_token.assert_called_once_with(
+        config, 1, 42, database.db_engine_spec, durable=True
+    )
+    assert create_engine_mock.call_args.args[0].drivername == "trino"
+    connect_args = create_engine_mock.call_args.kwargs["connect_args"]
+    assert connect_args["user"] == "alice"
+    assert connect_args["source"] == "Apache Superset"
+    assert [(key[0], key[3]) for key in _ENGINE_CACHE] == [(1, 42)]
+    _ENGINE_CACHE.clear()
+
+
+def test_get_sqla_engine_uses_context_execution_user(
+    mocker: MockerFixture,
+) -> None:
+    from superset.models.core import _ENGINE_CACHE
+
+    _ENGINE_CACHE.clear()
+    user = SimpleNamespace(id=42, username="alice", email="alice@example.org")
+    get_token = mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        return_value="token",
+    )
+    mocker.patch(
+        "superset.models.core.create_engine",
+        return_value=create_engine("sqlite://"),
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    database.id = 1
+    config = {"id": "client"}
+    mocker.patch.object(database, "get_oauth2_config", return_value=config)
+
+    with execution_identity(user):
+        database._get_sqla_engine(nullpool=False)
+
+    get_token.assert_called_once_with(
+        config, 1, 42, database.db_engine_spec, durable=True
+    )
+    assert [(key[0], key[3]) for key in _ENGINE_CACHE] == [(1, 42)]
+    _ENGINE_CACHE.clear()
+
+
+def test_get_sqla_engine_converts_owner_refresh_error(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        side_effect=OAuth2TokenRefreshError(),
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    mocker.patch.object(database, "get_oauth2_config", return_value={"id": "client"})
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        database._get_sqla_engine(
+            execution_user=SimpleNamespace(
+                id=42, username="alice", email="alice@example.org"
+            )
+        )
+
+
+def test_get_sqla_engine_execution_user_without_token(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        return_value=None,
+    )
+    mocker.patch(
+        "superset.models.core.has_stored_oauth2_token",
+        return_value=False,
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    mocker.patch.object(database, "get_oauth2_config", return_value={"id": "client"})
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        database._get_sqla_engine(
+            execution_user=SimpleNamespace(
+                id=42, username="alice", email="alice@example.org"
+            )
+        )
+
+
+def test_get_sqla_engine_execution_user_token_in_progress(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        return_value=None,
+    )
+    mocker.patch(
+        "superset.models.core.has_stored_oauth2_token",
+        return_value=True,
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    mocker.patch.object(database, "get_oauth2_config", return_value={"id": "client"})
+
+    with pytest.raises(OAuth2TokenRefreshInProgressError):
+        database._get_sqla_engine(
+            execution_user=SimpleNamespace(
+                id=42, username="alice", email="alice@example.org"
+            )
+        )
+
+
+def test_get_sqla_engine_reports_refresh_in_progress(
+    mocker: MockerFixture,
+    app_context: None,
+) -> None:
+    mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+        return_value=None,
+    )
+    mocker.patch(
+        "superset.models.core.has_stored_oauth2_token",
+        return_value=True,
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    database.id = 1
+    mocker.patch.object(database, "get_oauth2_config", return_value={"id": "client"})
+
+    with pytest.raises(OAuth2TokenRefreshInProgressError):
+        with database.get_sqla_engine(
+            execution_user=SimpleNamespace(
+                id=42, username="alice", email="alice@example.org"
+            )
+        ):
+            pass
+
+
+def test_start_oauth2_dance_suppressed_for_execution_user(
+    mocker: MockerFixture,
+) -> None:
+    from superset.utils.execution_identity import execution_identity
+
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+    )
+    mocker.patch(
+        "superset.db_engine_specs.trino.TrinoEngineSpec.start_oauth2_dance",
+    )
+
+    with execution_identity(SimpleNamespace(id=42, username="alice")):
+        with pytest.raises(DatasetExecutionUserTokenMissingError):
+            database.start_oauth2_dance()
+
+
 def test_get_impersonation_username_without_flag(mocker: MockerFixture) -> None:
     """
     Test that the login is used verbatim when the flag is off.
@@ -1612,6 +1808,7 @@ def test_engine_context_manager(mocker: MockerFixture, app_context: None) -> Non
         source=None,
         sqlalchemy_uri="trino://",
         cacheable=True,
+        execution_user=None,
     )
 
 
@@ -2554,3 +2751,33 @@ def test_function_names_returns_empty_list_when_engine_spec_raises(
 
     assert database.function_names == []
     assert logger.error.called
+
+
+def test_impersonation_identity_uses_execution_context(
+    mocker: MockerFixture,
+) -> None:
+    database = Database(database_name="my_db", sqlalchemy_uri="trino://")
+    user = SimpleNamespace(id=42, username="alice", email="alice@example.org")
+    mocker.patch("superset.models.core.get_username", return_value="bob")
+    url = make_url("trino://")
+
+    with execution_identity(user):
+        assert database.get_impersonation_username(url) == "alice"
+        assert database.get_impersonation_email(url) == "alice@example.org"
+
+
+def test_execute_with_oauth2_retry_skips_after_progress(
+    mocker: MockerFixture, app_context
+) -> None:
+    from superset.utils.oauth2 import execute_with_oauth2_retry
+
+    database = mocker.MagicMock()
+    database.get_oauth2_config.return_value = {}
+    database.db_engine_spec.needs_oauth2.return_value = True
+    database.start_oauth2_dance.side_effect = RuntimeError("dance")
+    operation = mocker.Mock(side_effect=OAuth2Error("auth"))
+
+    with pytest.raises(RuntimeError):
+        execute_with_oauth2_retry(database, operation, can_retry=lambda: False)
+
+    assert operation.call_count == 1

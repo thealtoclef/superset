@@ -173,7 +173,13 @@ def test_results_carry_the_expected_labels(
 ) -> None:
     from superset.models.core import Database
 
-    def get_df(sql: str, catalog: Any, schema: Any, mutator: Any = None) -> Any:
+    def get_df(
+        sql: str,
+        catalog: Any,
+        schema: Any,
+        mutator: Any = None,
+        execution_user: Any = None,
+    ) -> Any:
         # Name the columns after the SELECT aliases, as the engine would.
         names = re.findall(r"\bAS\s+\"?(\w+)\"?", sql)
         df = pd.DataFrame(rows, columns=names)

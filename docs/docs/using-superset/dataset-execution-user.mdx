@@ -1,0 +1,94 @@
+---
+title: Dataset Execution User
+sidebar_position: 8
+version: 1
+---
+
+# Dataset execution user
+
+A dataset can run its queries with the database credentials of a designated
+user instead of the viewer's. Superset row-level security, dataset access, and
+dashboard permissions remain viewer-based; only the identity used to connect to
+the analytical database changes.
+
+This is the equivalent of using the data source owner's credentials in a
+BI tool: a viewer without a personal database identity can query a dataset
+whose execution user has access.
+
+## Enabling
+
+1. Configure OAuth2 for the database and enable **Impersonate users**
+   (`impersonate_user`) on the connection. Both are required.
+2. Enable the `DATASET_EXECUTION_USER` feature flag:
+   ```python
+   FEATURE_FLAGS = {"DATASET_EXECUTION_USER": True}
+   ```
+3. Save the dataset, then open **Edit dataset → Settings**. Dataset editors
+   can switch **Use my database credentials** on to run the dataset as
+   themselves. Admins additionally get **Run as → Specific user** and can
+   assign any active user.
+
+The execution user is stored by username in the dataset's `extra` JSON, so it
+travels with dataset exports and survives deployment moves. Usernames are
+resolved on the target instance; an unknown user is dropped on import. A
+renamed user, or a deleted username that is later re-created for someone else,
+changes the resolved identity: re-save or clear the setting after such a
+change.
+
+## Authorizing
+
+The execution user must authorize the database once:
+
+1. Sign in as that user. The user must be able to open the dataset editor
+   (a dataset editor or an admin), because authorization starts there.
+2. Open the dataset editor. A warning shows that the token is missing.
+3. Click **Authorize database** and complete the OAuth2 flow.
+
+The token status is reported for the saved execution user. If the editor has
+an unsaved change to **Run as**, the panel asks you to save before checking
+the new user's token.
+
+Admins cannot authorize on another user's behalf. If the token is later
+revoked or expires beyond refresh, queries fail with
+`DATASET_EXECUTION_USER_TOKEN_MISSING` instead of starting a new OAuth2 flow;
+the execution user must re-authorize. Run `superset dataset-execution-health`
+to list datasets in this state.
+
+## Caching
+
+Results are cached per execution identity: a dataset in viewer mode and the
+same dataset in specific-user mode do not share cache entries, and different
+execution users do not share entries. The identity is added to the key only
+while owner mode is active (flag on, supported database, active user), so
+turning the flag off cannot serve owner-fetched rows from cache. When the
+execution user's token is missing, the cache is bypassed so stale rows are not
+served. The check is presence-based: a token revoked only at the identity
+provider is detected when the database rejects it, not before.
+
+## Security notes
+
+- Dataset editors may enable execution as themselves or clear the setting,
+  but cannot assign another user. Admins may assign any active user. Raw
+  `extra` cannot be used to bypass this rule.
+- There is no separate "creator" transfer: dataset creation is audit
+  metadata, not an authorization boundary. Ownership is the `editors` list.
+  To hand a dataset to someone else, add them as an editor (they can then
+  enable their own credentials); an admin reassigns a different execution
+  user.
+- A viewer sees whatever the execution user can see, filtered by the viewer's
+  own RLS. Use this only for datasets where that reach is intended.
+- Dataset editors who are not the execution user cannot change the dataset's
+  SQL or source while owner mode is on; they must clear or take over the
+  execution identity first. Anyone who can build charts on the dataset can
+  still run ad-hoc SQL metrics with the execution identity, so treat dataset
+  access as equivalent to the execution user's data access.
+- The setting is inert at query time when the database does not use OAuth2
+  impersonation. Assigning or changing it on such a database is rejected; an
+  existing value must be cleared before changing the database source.
+- Owner-mode token refreshes are committed before the distributed lock is
+  released, so concurrent dashboard loads do not exchange the same rotating
+  refresh token. A viewer cannot trigger a forced refresh of the execution
+  user's token.
+- Reports, thumbnails, async chart tasks, and embedded guests use the dataset
+  execution identity; their RLS is still based on the report executor or the
+  guest.
