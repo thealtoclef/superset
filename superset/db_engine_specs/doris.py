@@ -20,6 +20,9 @@ from re import Pattern
 from typing import Any, Callable, Optional
 from urllib import parse
 
+import jwt
+import requests
+from flask import current_app
 from flask_babel import gettext as __, lazy_gettext as _
 from sqlalchemy import Float, Integer, Numeric, String, TEXT, text, types
 from sqlalchemy.engine.reflection import Inspector
@@ -138,6 +141,8 @@ class DorisEngineSpec(MySQLEngineSpec):
     )
     # REQUIRED can fall back with MariaDB Connector/C; verification fails closed.
     encryption_parameters = {"ssl_mode": MYSQL_SSL_MODE_VERIFY_CA}
+    supports_oauth2 = True
+    oauth2_exception = requests.exceptions.HTTPError
     supports_dynamic_schema = True
     supports_catalog = supports_dynamic_catalog = True
     # while technically supported by Doris, this generates invalid table identifiers
@@ -154,6 +159,50 @@ class DorisEngineSpec(MySQLEngineSpec):
         TimeGrain.QUARTER: "MAKEDATE(YEAR({col}), 1) "
         "+ INTERVAL (QUARTER({col}) - 1) * 3 MONTH",
     }
+
+    @classmethod
+    def impersonate_user(
+        cls,
+        database: Database,
+        username: str | None,
+        user_token: str | None,
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
+        if not database.is_oauth2_enabled():
+            return super().impersonate_user(
+                database, username, user_token, url, engine_kwargs
+            )
+        if user_token is None:
+            cls.start_oauth2_dance(database)
+        url = url.set(
+            username=cls._oauth2_login(username, user_token),
+            password=user_token,
+        )
+        engine_kwargs.setdefault("connect_args", {})["ssl_mode"] = (
+            MYSQL_SSL_MODE_REQUIRED
+        )
+        return url, engine_kwargs
+
+    @classmethod
+    def _oauth2_login(cls, username: str | None, user_token: str | None) -> str | None:
+        """Return the login Doris compares against its OIDC subject_claim."""
+        config = current_app.config.get("DATABASE_OAUTH2_CLIENTS", {}).get(
+            cls.engine_name, {}
+        )
+        claim = config.get("username_claim")
+        if not claim or not user_token:
+            return username
+        try:
+            claims = jwt.decode(user_token, options={"verify_signature": False})
+        except jwt.InvalidTokenError:
+            return username
+        value: Any = claims
+        for part in claim.split("."):
+            if not isinstance(value, dict):
+                return username
+            value = value.get(part)
+        return value if isinstance(value, str) and value else username
 
     metadata = {
         "description": (

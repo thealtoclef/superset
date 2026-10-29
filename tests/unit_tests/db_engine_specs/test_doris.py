@@ -505,3 +505,129 @@ def test_doris_tls_preserves_uri_query(mode: str) -> None:
         url, args = DorisEngineSpec.adjust_engine_params(uri, {})
     assert url == uri
     assert args["ssl_mode"] == ("VERIFY_CA" if mode == "REQUIRED" else mode)
+
+
+def test_impersonate_user_with_oauth2(mocker: MockerFixture, app_context: None) -> None:
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    url = make_url("doris://bob:old@host:9030/db")
+
+    result, kwargs = DorisEngineSpec.impersonate_user(
+        database, "alice@example.com", "token", url, {}
+    )
+
+    assert result.username == "alice@example.com"
+    assert result.password == "token"  # noqa: S105
+    assert kwargs["connect_args"]["ssl_mode"] == "REQUIRED"
+
+
+def test_impersonate_user_ignores_token_claims(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    import jwt
+
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    token = jwt.encode(
+        {"preferred_username": "other@example.com"},
+        "secret",
+        algorithm="HS256",
+    )
+    url = make_url("doris://old@host:9030/db")
+
+    result, _ = DorisEngineSpec.impersonate_user(
+        database, "alice@example.com", token, url, {}
+    )
+
+    assert result.username == "alice@example.com"
+
+
+def test_impersonate_user_uses_configured_claim(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    import jwt
+    from flask import current_app
+
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    mocker.patch.dict(
+        current_app.config,
+        {
+            "DATABASE_OAUTH2_CLIENTS": {
+                "Apache Doris": {"username_claim": "preferred_username"}
+            }
+        },
+    )
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    token = jwt.encode(
+        {"preferred_username": "alice@example.com"},
+        "secret",
+        algorithm="HS256",
+    )
+    url = make_url("doris://old@host:9030/db")
+
+    result, _ = DorisEngineSpec.impersonate_user(database, "bob", token, url, {})
+
+    assert result.username == "alice@example.com"
+
+
+def test_impersonate_user_configured_claim_missing(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    import jwt
+    from flask import current_app
+
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    mocker.patch.dict(
+        current_app.config,
+        {"DATABASE_OAUTH2_CLIENTS": {"Apache Doris": {"username_claim": "email"}}},
+    )
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    token = jwt.encode(
+        {"preferred_username": "alice@example.com"},
+        "secret",
+        algorithm="HS256",
+    )
+    url = make_url("doris://old@host:9030/db")
+
+    result, _ = DorisEngineSpec.impersonate_user(database, "bob", token, url, {})
+
+    assert result.username == "bob"
+
+
+def test_impersonate_user_without_oauth2(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = False
+    url = make_url("doris://old@host:9030/db")
+
+    result, kwargs = DorisEngineSpec.impersonate_user(database, "alice", None, url, {})
+
+    assert result.username == "alice"
+    assert "ssl_mode" not in kwargs.get("connect_args", {})
+
+
+def test_impersonate_user_without_token_starts_dance(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    mocker.patch.object(
+        DorisEngineSpec, "start_oauth2_dance", side_effect=RuntimeError("dance")
+    )
+    url = make_url("doris://old@host:9030/db")
+
+    with pytest.raises(RuntimeError, match="dance"):
+        DorisEngineSpec.impersonate_user(database, "alice", None, url, {})
