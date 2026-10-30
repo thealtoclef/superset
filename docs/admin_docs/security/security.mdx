@@ -19,6 +19,33 @@ the **superset init** command (often done between Superset versions).
 
 A table with the permissions for these roles can be found at [/RESOURCES/STANDARD_ROLES.md](https://github.com/apache/superset/blob/master/RESOURCES/STANDARD_ROLES.md).
 
+### Restricting built-in role permissions
+
+You can deny specific FAB permissions globally without creating a separate
+baseline role:
+
+```python
+AUTH_USER_REGISTRATION_ROLE = "Gamma"
+
+BANNED_PERMISSIONS = [
+    "can_grant",
+    "all_datasource_access",
+    "all_database_access",
+]
+BANNED_VIEWS = ["RowLevelSecurity"]
+BANNED_PVMS = [["can_read", "SomeView"]]
+```
+
+The configured admin role (`AUTH_ROLE_ADMIN`, `Admin` by default) always keeps
+the full permission set. The restrictions are applied when built-in role
+permissions are synchronized and when role permissions are checked. They also
+prevent `add_permission_role` from adding a denied permission to a non-admin
+role. Direct database edits remain outside this check.
+
+`AUTH_USER_REGISTRATION_ROLE` applies to authenticated users. Do not set the
+anonymous **Public** role to `Gamma`; use `PUBLIC_ROLE_LIKE` only when anonymous
+dashboard access is intended.
+
 ### Admin
 
 Admins have all possible rights, including granting or revoking rights from other

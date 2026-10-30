@@ -23,6 +23,7 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Set as AbstractSet
+from functools import cached_property
 from math import ceil
 from types import SimpleNamespace
 from typing import (
@@ -2414,6 +2415,66 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
     ) -> Optional[str]:
         return f"[{database_name}].[{dataset_name}](id:{dataset_id})"
 
+    @cached_property
+    def _banned_permission_config(
+        self,
+    ) -> tuple[set[str], set[str], set[tuple[str, str]]]:
+        config = current_app.config
+        permissions = config.get("BANNED_PERMISSIONS") or []
+        views = config.get("BANNED_VIEWS") or []
+        pvms = {
+            (item[0], item[1])
+            for item in (config.get("BANNED_PVMS") or [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
+        return set(permissions), set(views), pvms
+
+    def _is_banned_permission(self, permission_name: str, view_name: str) -> bool:
+        permissions, views, pvms = self._banned_permission_config
+        return (
+            permission_name in permissions
+            or view_name in views
+            or (permission_name, view_name) in pvms
+        )
+
+    def _is_banned_pvm(self, pvm: PermissionView) -> bool:
+        return bool(
+            pvm.permission
+            and pvm.view_menu
+            and self._is_banned_permission(
+                pvm.permission.name,
+                pvm.view_menu.name,
+            )
+        )
+
+    def _is_banned_exempt_role(self, role_name: str) -> bool:
+        return role_name == self.auth_role_admin
+
+    def _has_banned_exempt_role(self, user: Any) -> bool:
+        return any(
+            role.name == self.auth_role_admin
+            for role in (getattr(user, "roles", None) or [])
+        )
+
+    def _filter_banned_role(self, role: Any) -> None:
+        if self._is_banned_exempt_role(role.name):
+            return
+        role.permissions = [
+            pvm for pvm in role.permissions if not self._is_banned_pvm(pvm)
+        ]
+
+    def _has_view_access(self, user: Any, permission_name: str, view_name: str) -> bool:
+        if self._is_banned_permission(
+            permission_name, view_name
+        ) and not self._has_banned_exempt_role(user):
+            return False
+        return super()._has_view_access(user, permission_name, view_name)
+
+    def is_item_public(self, permission_name: str, view_name: str) -> bool:
+        if self._is_banned_permission(permission_name, view_name):
+            return False
+        return super().is_item_public(permission_name, view_name)
+
     def can_access(self, permission_name: str, view_name: str) -> bool:
         """
         Return True if the user can access the FAB permission/view, False otherwise.
@@ -2427,6 +2488,10 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         """
 
         user = g.user
+        if self._is_banned_permission(
+            permission_name, view_name
+        ) and not self._has_banned_exempt_role(user):
+            return False
         if user.is_anonymous:
             return self.is_item_public(permission_name, view_name)
         return self._has_view_access(user, permission_name, view_name)
@@ -3417,6 +3482,7 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
                 ):
                     role_from_permissions.append(permission_view)
         role_to.permissions = role_from_permissions
+        self._filter_banned_role(role_to)
 
     def set_role(
         self,
@@ -3433,10 +3499,28 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
 
         logger.info("Syncing %s perms", role_name)
         role = self.add_role(role_name)
+        exempt = self._is_banned_exempt_role(role_name)
         role_pvms = [
-            permission_view for permission_view in pvms if pvm_check(permission_view)
+            permission_view
+            for permission_view in pvms
+            if pvm_check(permission_view)
+            and (exempt or not self._is_banned_pvm(permission_view))
         ]
         role.permissions = role_pvms
+
+    def add_permission_role(self, role: Any, perm_view: PermissionView) -> None:
+        if (
+            perm_view
+            and self._is_banned_pvm(perm_view)
+            and not self._is_banned_exempt_role(role.name)
+        ):
+            logger.warning(
+                "Refusing banned permission %s on role %s",
+                perm_view,
+                role.name,
+            )
+            return
+        super().add_permission_role(role, perm_view)
 
     def _is_admin_only(self, pvm: PermissionView) -> bool:
         """

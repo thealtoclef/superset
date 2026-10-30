@@ -533,6 +533,14 @@ AUTH_TYPE = AUTH_DB
 # dashboards. Explicit grant on specific datasets is still required.
 PUBLIC_ROLE_LIKE: str | None = None
 
+# Global FAB role permission denials. These are enforced whenever role
+# permissions are synced or checked, not just when a built-in role is created.
+# The configured admin role is always exempt. BANNED_PVMS entries are
+# (permission_name, view_name) pairs.
+BANNED_PERMISSIONS: list[str] = []
+BANNED_VIEWS: list[str] = []
+BANNED_PVMS: list[list[str]] = []
+
 # ---------------------------------------------------
 # Babel config for translations
 # ---------------------------------------------------
