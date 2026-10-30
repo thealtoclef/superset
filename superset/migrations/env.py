@@ -37,6 +37,8 @@ if not current_app.config["ALEMBIC_SKIP_LOG_CONFIG"]:
 logger = logging.getLogger("alembic.env")
 
 DATABASE_URI = current_app.config["SQLALCHEMY_DATABASE_URI"]
+if not isinstance(DATABASE_URI, str):
+    DATABASE_URI = DATABASE_URI.render_as_string(hide_password=False)
 if "sqlite" in DATABASE_URI:
     logger.warning(
         "SQLite Database support for metadata databases will \
@@ -107,10 +109,15 @@ def run_migrations_online() -> None:
                 directives[:] = []
                 logger.info("No changes in schema detected.")
 
+    engine_kwargs = {}
+    if engine_options := current_app.config.get("SQLALCHEMY_ENGINE_OPTIONS"):
+        if creator := engine_options.get("creator"):
+            engine_kwargs["creator"] = creator
     engine = engine_from_config(
         config.get_section(config.config_ini_section),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        **engine_kwargs,
     )
 
     connection = engine.connect()

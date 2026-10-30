@@ -1,0 +1,141 @@
+---
+title: Cloud SQL Connections
+sidebar_position: 10
+version: 1
+---
+
+# Cloud SQL Connections
+
+The fork can connect to Cloud SQL through the
+[Cloud SQL Python connector](https://github.com/GoogleCloudPlatform/cloud-sql-python-connector)
+instead of a Cloud SQL Auth Proxy sidecar. The connector uses Application
+Default Credentials (ADC), Cloud SQL IAM authorization, and a TLS 1.3 channel
+managed by the connector.
+
+## Install
+
+```bash
+pip install "apache-superset[cloudsql]"
+```
+
+The extra installs the connector with `pg8000` for PostgreSQL and `pymysql`
+for MySQL.
+
+## Enable
+
+```python
+CLOUDSQL_CONNECTOR_ENABLED = True
+```
+
+The instance comes from the URI. There is no separate Superset-side instance
+allowlist. Whether the connector can connect is determined by the Application
+Default Credentials principal's Cloud SQL IAM authorization and database
+authentication. Failures surface as the connector's normal DBAPI exceptions.
+Because IAM authentication uses that principal rather than the Superset
+requester, scope the service account's Cloud SQL access to the instances
+Superset is allowed to use.
+
+When enabled, `DB_CONNECTION_MUTATOR` is wrapped so URIs carrying `cloudsql_*`
+parameters get a DBAPI `creator` and the parameters are removed before the URI
+reaches SQLAlchemy. An existing mutator, such as a BigQuery labels mutator, runs
+first; the Cloud SQL transformation then sees its final URI. Connection
+authorization failures surface as the connector's normal DBAPI exceptions; the
+mutator does not catch or rewrite them.
+
+## Database URIs
+
+PostgreSQL with IAM database authentication:
+
+```text
+postgresql+pg8000://sa@/db?cloudsql_instance=project:region:instance&cloudsql_ip_type=PRIVATE&cloudsql_enable_iam_auth=true
+```
+
+MySQL with a password:
+
+```text
+mysql+pymysql://user:password@/db?cloudsql_instance=project:region:instance&cloudsql_ip_type=PRIVATE
+```
+
+| Parameter | Required | Default | Meaning |
+|---|---|---|---|
+| `cloudsql_instance` | yes | — | `project:region:instance` |
+| `cloudsql_driver` | no | URL driver | `pymysql` or `pg8000` |
+| `cloudsql_ip_type` | no | `PUBLIC` | `PUBLIC`, `PRIVATE`, or `PSC` |
+| `cloudsql_enable_iam_auth` | no | `false` | Use Cloud SQL automatic IAM database authentication |
+| `cloudsql_timeout` | no | `30` | Connector timeout in seconds |
+
+The URI host is intentionally empty. The connector resolves the instance from
+`cloudsql_instance`, not from the host.
+
+For IAM authentication, omit the password. Use the IAM database user:
+
+- MySQL: the user's local part, for example `alice` for
+  `alice@example.com`, or the service account local part.
+- PostgreSQL: the full email, or the service account email without the
+  `.gserviceaccount.com` suffix.
+
+The connector normalizes the user again for automatic IAM authentication, so
+passing the full principal is also accepted. Percent-encode an `@` in the URI
+username as `%40`, for example `sa%40project.iam`.
+
+## Metadata database
+
+The same `cloudsql_*` URI parameters work for the Superset metadata database.
+When `CLOUDSQL_CONNECTOR_ENABLED` is true, the final
+`SQLALCHEMY_DATABASE_URI` is rewritten after `superset_config.py` and
+`SUPERSET__SQLALCHEMY_DATABASE_URI` are applied:
+
+```python
+CLOUDSQL_CONNECTOR_ENABLED = True
+SQLALCHEMY_DATABASE_URI = (
+    "postgresql+pg8000://sa@/superset"
+    "?cloudsql_instance=project:region:instance"
+    "&cloudsql_ip_type=PRIVATE"
+    "&cloudsql_enable_iam_auth=true"
+)
+```
+
+The URI is rewritten to a string, not a `URL` object, because Flask and
+Alembic read `SQLALCHEMY_DATABASE_URI` as a string. The migration environment
+forwards the `creator` from `SQLALCHEMY_ENGINE_OPTIONS` to its engine;
+pool-sizing options are ignored because migrations use `NullPool`.
+
+The rewrite happens before `superset db upgrade`, `superset init`, and the web
+and worker processes start, so the migration and init Jobs use the connector as
+well. `configure_cloudsql_uri()` remains available for explicit programmatic
+configuration.
+
+## Credentials and networking
+
+The connector uses ADC. On GKE, use Workload Identity and grant the Kubernetes
+service account:
+
+- `roles/cloudsql.client` for Cloud SQL connection authorization;
+- an IAM database user when `cloudsql_enable_iam_auth` is enabled.
+
+Private IP requires the cluster network to reach the instance's private IP;
+the connector does not create a proxy listener on `127.0.0.1`.
+
+## Engine behavior
+
+`configure_cloudsql` returns:
+
+```python
+{
+    "creator": <CloudSQLCreator>,
+    "pool_pre_ping": True,
+    "pool_recycle": 1800,
+}
+```
+
+The creator caches one `Connector` per `(instance, ip_type, IAM, timeout)` and
+is lazy: constructing a creator does not start a background connector thread
+until the first connection. The engine cache can therefore reuse an engine even
+though the mutator constructs a fresh creator object. The cache is cleared in
+forked children, so Celery prefork workers create their own connector instead
+of waiting on a parent thread.
+
+Non-TLS URL query options and `extra.engine_params.connect_args` are merged into
+the connector's driver arguments. TLS options are stripped because the
+connector already runs inside its own encrypted channel and derives
+certificates from the instance.

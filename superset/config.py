@@ -2234,6 +2234,10 @@ ENGINE_CONTEXT_MANAGER = engine_context_manager
 # as such `create_engine(url, **params)`
 DB_CONNECTION_MUTATOR = None
 
+# When enabled, Cloud SQL URIs carrying cloudsql_* query parameters are routed
+# through the Cloud SQL Python connector instead of a local auth proxy.
+CLOUDSQL_CONNECTOR_ENABLED = False
+
 
 # A callable that is invoked for every invocation of DB Engine Specs
 # which allows for custom validation of the engine URI.
@@ -3506,6 +3510,11 @@ if globals().get("OTEL_LOGGING_ENABLED", False):
 
     STATS_LOGGER, EVENT_LOGGER = create_otel_loggers()
 
+if globals().get("CLOUDSQL_CONNECTOR_ENABLED", False):
+    from superset.databases.cloudsql import with_cloudsql
+
+    DB_CONNECTION_MUTATOR = with_cloudsql(globals().get("DB_CONNECTION_MUTATOR"))
+
 # Final environment variable processing - must be at the very end
 # to override any config file assignments
 ENV_VAR_KEYS = {
@@ -3517,6 +3526,23 @@ for env_var in ENV_VAR_KEYS:
     if env_var in os.environ:
         config_var = env_var.replace("SUPERSET__", "")
         globals()[config_var] = os.environ[env_var]
+
+# The metadata database bypasses DB_CONNECTION_MUTATOR, so configure its
+# connector after the final URI is known.
+if globals().get("CLOUDSQL_CONNECTOR_ENABLED", False):
+    from superset.databases.cloudsql import configure_cloudsql_uri
+    from superset.databases.utils import make_url_safe
+
+    _metadata_uri = globals().get("SQLALCHEMY_DATABASE_URI")
+    if _metadata_uri:
+        _metadata_url = make_url_safe(_metadata_uri)
+        if "cloudsql_instance" in _metadata_url.query:
+            _metadata_uri, _metadata_options = configure_cloudsql_uri(_metadata_url)
+            globals()["SQLALCHEMY_DATABASE_URI"] = _metadata_uri
+            globals()["SQLALCHEMY_ENGINE_OPTIONS"] = {
+                **(globals().get("SQLALCHEMY_ENGINE_OPTIONS") or {}),
+                **_metadata_options,
+            }
 
 # THEME_DEFAULT / THEME_DARK are defined before the overrides above are applied,
 # so re-sync the logo link from the final LOGO_TARGET_PATH value here. This lets

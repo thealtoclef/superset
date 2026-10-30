@@ -247,6 +247,9 @@ ocient = [
     "geojson",
 ]
 oracle = ["oracledb>=4.0.2, <5"]
+cloudsql = [
+    "cloud-sql-python-connector[pg8000,pymysql]>=1.18.0, <2",
+]
 otel = [
     "opentelemetry-sdk>=1.39.1, <2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.39.1, <2",

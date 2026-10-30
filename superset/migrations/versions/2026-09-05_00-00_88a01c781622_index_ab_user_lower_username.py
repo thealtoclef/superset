@@ -100,6 +100,14 @@ def upgrade() -> None:
                 f"CREATE INDEX IF NOT EXISTS {INDEX_NAME} "
                 f"ON {TABLE_NAME} (lower(username))"
             )
+        elif bind.dialect.driver == "pg8000":
+            # pg8000 does not reliably leave the surrounding transaction for
+            # Alembic's autocommit block. Fall back to a transactional index
+            # build there; the metadata table is small enough for migrations.
+            op.execute(
+                f"CREATE INDEX IF NOT EXISTS {INDEX_NAME} "
+                f"ON {TABLE_NAME} (lower(username))"
+            )
         else:
             # Online mode: build the index CONCURRENTLY so we do not take an
             # exclusive lock on ab_user, which is read on essentially every
@@ -131,6 +139,8 @@ def downgrade() -> None:
 
     if dialect == "postgresql":
         if ctx.as_sql:
+            op.execute(f"DROP INDEX IF EXISTS {INDEX_NAME}")
+        elif bind.dialect.driver == "pg8000":
             op.execute(f"DROP INDEX IF EXISTS {INDEX_NAME}")
         else:
             with ctx.autocommit_block():

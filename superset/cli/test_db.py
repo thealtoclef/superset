@@ -37,7 +37,7 @@ from sqlalchemy import (
     String,
     Table,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import NoSuchModuleError
 
 from superset.databases.utils import make_url_safe
@@ -280,7 +280,17 @@ def test_sqlalchemy_dialect(
     """
     Test the SQLAlchemy dialect, making sure it supports everything Superset needs.
     """
-    engine = create_engine(sqlalchemy_uri, **engine_kwargs)
+    from superset.databases.cloudsql import configure_cloudsql
+
+    engine_uri: str | URL = sqlalchemy_uri
+    url = make_url_safe(engine_uri)
+    if "cloudsql_instance" in url.query:
+        engine_uri, cloud_sql_options = configure_cloudsql(
+            url,
+            connect_args=engine_kwargs.get("connect_args"),
+        )
+        engine_kwargs = {**engine_kwargs, **cloud_sql_options}
+    engine = create_engine(engine_uri, **engine_kwargs)
     dialect = engine.dialect
 
     console.print("[bold]Checking functions used by the inspector...")

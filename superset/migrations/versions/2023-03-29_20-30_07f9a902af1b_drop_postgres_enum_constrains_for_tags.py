@@ -28,12 +28,11 @@ down_revision = "b5ea9d343307"
 
 from alembic import op  # noqa: E402
 from sqlalchemy import text  # noqa: E402
-from sqlalchemy.dialects import postgresql  # noqa: E402
 
 
 def upgrade():
     conn = op.get_bind()
-    if isinstance(conn.dialect, postgresql.dialect):
+    if conn.dialect.name == "postgresql":
         conn.execute(
             text('ALTER TABLE "tagged_object" ALTER COLUMN "object_type" TYPE VARCHAR')
         )
