@@ -3410,6 +3410,9 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         self.create_missing_perms()
         self.clean_perms()
 
+        if current_app.config.get("AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT"):
+            self._sync_static_roles()
+
     def _get_all_pvms(self) -> list[PermissionView]:
         """
         Gets list of all PVM
@@ -5892,6 +5895,21 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
     def get_anonymous_user(self) -> User:
         return AnonymousUserMixin()
 
+    def _sync_static_roles(self) -> None:
+        if not self._static_role_mapping():
+            return
+        users = (
+            self.session.query(self.user_model)
+            .filter(
+                self.user_model.active.is_(True),
+                self.user_model.email.isnot(None),
+            )
+            .all()
+        )
+        for user in users:
+            user.roles = self._static_roles_for_user(user)
+        self.session.commit()
+
     def get_user_roles(self, user: Optional[User] = None) -> list[Role]:
         if not user:
             user = g.user
@@ -5899,6 +5917,57 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
             public_role = get_conf().get("AUTH_ROLE_PUBLIC")
             return [self.get_public_role()] if public_role else []
         return super().get_user_roles(user)
+
+    def _static_role_mapping(self) -> dict[str, Any] | None:
+        mapping = current_app.config.get("AUTH_STATIC_ROLE_MAPPING") or {}
+        if not isinstance(mapping, dict):
+            logger.warning("AUTH_STATIC_ROLE_MAPPING must be a role-to-emails map")
+            return None
+        return mapping or None
+
+    def _add_static_roles(self, roles: list[Any], email: str) -> None:
+        mapping = self._static_role_mapping()
+        if not mapping or not email:
+            return
+
+        normalized_email = email.strip().lower()
+        existing = {role.name for role in roles if role}
+        for role_name, emails in mapping.items():
+            if isinstance(emails, str):
+                emails = [emails]
+            if not isinstance(emails, (list, tuple, set)):
+                logger.warning(
+                    "AUTH_STATIC_ROLE_MAPPING entry for %s must be a list",
+                    role_name,
+                )
+                continue
+            if normalized_email not in {str(item).strip().lower() for item in emails}:
+                continue
+            if role_name in existing:
+                continue
+            role = self.find_role(role_name)
+            if not role:
+                logger.warning(
+                    "AUTH_STATIC_ROLE_MAPPING references missing role %s",
+                    role_name,
+                )
+                continue
+            roles.append(role)
+            existing.add(role_name)
+
+    def _static_roles_for_user(self, user: User) -> list[Any]:
+        roles: list[Any] = []
+        registration_role = self.find_role(self.auth_user_registration_role)
+        if registration_role:
+            roles.append(registration_role)
+        self._add_static_roles(roles, user.email or "")
+        return roles
+
+    def _oauth_calculate_user_roles(self, userinfo: dict[str, Any]) -> list[Any]:
+        roles = super()._oauth_calculate_user_roles(userinfo)
+        email = str(userinfo.get("email") or userinfo.get("username") or "")
+        self._add_static_roles(roles, email)
+        return roles
 
     def raise_for_unsupported_guest_rls(
         self, datasource: "BaseDatasource | Explorable"

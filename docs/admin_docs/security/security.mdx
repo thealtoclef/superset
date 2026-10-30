@@ -46,6 +46,37 @@ role. Direct database edits remain outside this check.
 anonymous **Public** role to `Gamma`; use `PUBLIC_ROLE_LIKE` only when anonymous
 dashboard access is intended.
 
+### Static role mapping at login
+
+When the identity provider does not emit group or role claims, map Superset
+roles to email addresses instead:
+
+```python
+AUTH_ROLES_SYNC_AT_LOGIN = True
+AUTH_USER_REGISTRATION_ROLE = "Gamma"
+AUTH_STATIC_ROLE_MAPPING = {
+    "doris_platform": ["alice@cake.vn", "bob@cake.vn"],
+    "finance_analysts": ["carol@cake.vn"],
+}
+# Apply the same mapping to existing active users during `superset init`.
+AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT = True
+```
+
+The mapping is role name to email addresses. Emails are matched
+case-insensitively. Mapped roles are added to the roles FAB calculates from
+`AUTH_ROLES_MAPPING` and `AUTH_USER_REGISTRATION_ROLE`. New users get the
+mapping during registration; existing users get it on their next login when
+`AUTH_ROLES_SYNC_AT_LOGIN` is enabled. Because login synchronization replaces
+the user's role list, roles not present in the IdP mapping, the static mapping,
+or the registration role are removed. `AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT`
+applies the same mapping to all active users during `superset init`, so a
+deployment init Job can replace periodic cron-based reconciliation.
+
+Referenced roles must already exist. Missing roles are logged and skipped.
+This is role assignment only: it does not create the roles, their permissions,
+dashboard viewers, or RLS subjects. Leave `AUTH_ROLES_MAPPING` empty when the
+IdP has no group claims.
+
 ### Admin
 
 Admins have all possible rights, including granting or revoking rights from other

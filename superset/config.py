@@ -517,6 +517,16 @@ AUTH_TYPE = AUTH_DB
 # The default user self registration role
 # AUTH_USER_REGISTRATION_ROLE = "Public"
 
+# Optional static role mapping for OAuth logins. The mapping is role name to
+# email addresses and is applied by SupersetSecurityManager when FAB calculates
+# OAuth roles, including AUTH_ROLES_SYNC_AT_LOGIN. Use this when the IdP does
+# not emit group or role claims.
+AUTH_STATIC_ROLE_MAPPING: dict[str, list[str]] = {}
+# Also reconcile all active users from AUTH_STATIC_ROLE_MAPPING during
+# `superset init`. This lets deployment init jobs replace a periodic role
+# reconciliation CronJob. Login synchronization still applies the mapping.
+AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT: bool = False
+
 # When using LDAP Auth, setup the LDAP server
 # AUTH_LDAP_SERVER = "ldap://ldapserver.new"
 
