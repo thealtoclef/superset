@@ -3840,10 +3840,16 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         database_name: str,
     ) -> None:
         view_menu_name = self.get_database_perm(database_id, database_name)
-        # Clean database access permission
-        self._delete_pvm_on_sqla_event(
-            mapper, connection, "database_access", view_menu_name
-        )
+        # Clean both permissions that share the database view menu. The helper
+        # leaves the view menu in place while another PVM still references it, so
+        # deleting database_access alone no longer orphans database_dataset_access.
+        for perm_name in ("database_access", "database_dataset_access"):
+            self._delete_pvm_on_sqla_event(
+                mapper,
+                connection,
+                permission_name=perm_name,
+                view_menu_name=view_menu_name,
+            )
         # Clean database schema permissions
         schema_pvms = (
             self.session.query(self.permissionview_model)
@@ -4787,9 +4793,15 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
             )
         )
         self.on_permission_view_after_delete(mapper, connection, pvm)
-        connection.execute(
-            view_menu_table.delete().where(view_menu_table.c.id == pvm.view_menu_id)
-        )
+        remaining = connection.execute(
+            select(sa_func.count())
+            .select_from(permission_view_menu_table)
+            .where(permission_view_menu_table.c.view_menu_id == pvm.view_menu_id)
+        ).scalar()
+        if not remaining:
+            connection.execute(
+                view_menu_table.delete().where(view_menu_table.c.id == pvm.view_menu_id)
+            )
 
     def _find_permission_on_sqla_event(
         self, connection: Connection, name: str

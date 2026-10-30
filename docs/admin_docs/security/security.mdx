@@ -95,10 +95,73 @@ database selector, or database metadata APIs. Grant the built-in `sql_lab` role
 only to users who also have a `database_access` grant for the databases they may
 query in SQL Lab.
 
-Grant the permission to a role through FAB role administration. Roles remain
-permission bundles and are assigned to users through
-`AUTH_STATIC_ROLE_MAPPING`; the permission does not create per-user roles,
-dashboard viewers, or RLS subjects.
+Grant the permission to a role through FAB role administration or the access
+sync command below. Roles remain permission bundles and are assigned to users
+through `AUTH_STATIC_ROLE_MAPPING`; the permission does not create per-user
+roles, dashboard viewers, or RLS subjects.
+
+### Declarative database access
+
+`sync_access` reconciles each database once, keyed by its Superset database name.
+Access modes are keys under the database and contain roles, not users:
+
+```yaml
+# sync_access.yaml
+databases:
+  cake-mysql:
+    datasets:
+      - team_finance_datasets
+    database:
+      - team_finance_sql
+
+  cake-alloydb:
+    database:
+      - team_platform
+```
+
+- `datasets` grants `database_dataset_access`: every current and future dataset
+  in the database, without SQL Lab. It is a mode, not a list of table names.
+- `database` grants `database_access`: every dataset and SQL Lab when the role
+  also has SQL Lab permissions.
+- A database can define both modes for different roles without repeating the
+  database.
+
+Run it after the init/import steps:
+
+```bash
+superset sync_access -p /app/configs/sync_access.yaml
+```
+
+Every listed member must be an existing role. The command fails on an unknown
+role and never creates roles, per-user roles, dashboard viewers, or RLS subjects.
+Users receive these roles through `AUTH_STATIC_ROLE_MAPPING` or FAB.
+
+The command is authoritative for managed database PVMs. It removes
+`database_access` and `database_dataset_access` grants that are not listed for a
+role, including roles that no longer appear anywhere in the file. It never
+changes role membership or deletes roles, so a removed role keeps its other
+permissions and users until an administrator or `AUTH_STATIC_ROLE_MAPPING`
+removes the membership. The built-in Admin role is skipped.
+
+### Datasource reconciliation
+
+`sync_datasources` accepts flat v0 datasource YAML; there is no separate
+`sync_datasources.yaml`:
+
+```bash
+superset sync_datasources -p /app/configs/import_datasources.yaml
+```
+
+Databases absent from the file are deleted only when no datasets or reports
+reference them. A blocked database is logged with its dataset IDs and any
+database-bound report schedule IDs, then left in place; the command continues
+and exits successfully. Reports attached to a chart or dashboard have no
+`database_id`; they do not block database deletion and are not logged here.
+
+It does not cascade. Datasets, charts, and dashboards are never deleted by this
+command. Deleting a dataset does not delete its charts either: chart rows remain
+and keep referencing the missing dataset, so remove charts explicitly before
+removing the dataset when a clean dashboard is required.
 
 ### Admin
 

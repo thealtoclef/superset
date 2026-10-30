@@ -95,3 +95,41 @@ def test_create_missing_perms_creates_database_dataset_access(
     manager.add_permission_view_menu.assert_any_call(
         "database_dataset_access", "[db].(id:1)"
     )
+
+
+def test_delete_database_permissions_removes_both_pvms(
+    mocker: MockerFixture,
+) -> None:
+    manager = mocker.MagicMock()
+    manager.get_database_perm.return_value = "[db].(id:1)"
+    schema_query = (
+        manager.session.query.return_value.join.return_value.join.return_value
+    )
+    schema_query.filter.return_value.filter.return_value.all.return_value = []
+    mapper = mocker.MagicMock()
+    connection = mocker.MagicMock()
+
+    SupersetSecurityManager._delete_vm_database_access(
+        manager,
+        mapper,
+        connection,
+        1,
+        "db",
+    )
+
+    manager._delete_pvm_on_sqla_event.assert_has_calls(
+        [
+            mocker.call(
+                mapper,
+                connection,
+                permission_name="database_access",
+                view_menu_name="[db].(id:1)",
+            ),
+            mocker.call(
+                mapper,
+                connection,
+                permission_name="database_dataset_access",
+                view_menu_name="[db].(id:1)",
+            ),
+        ]
+    )
