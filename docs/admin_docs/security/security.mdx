@@ -77,6 +77,29 @@ This is role assignment only: it does not create the roles, their permissions,
 dashboard viewers, or RLS subjects. Leave `AUTH_ROLES_MAPPING` empty when the
 IdP has no group claims.
 
+### Database dataset access
+
+The fork adds `database_dataset_access`, a database-scoped FAB permission. Its
+permission view menu is the database permission string:
+
+```text
+database_dataset_access -> [database].(id:N)
+```
+
+`superset init` creates the PVM for each database. The permission covers every
+dataset in the database, including datasets created later, without granting
+`database_access`.
+
+It does not satisfy `can_access_database`, so it does not allow SQL Lab, the
+database selector, or database metadata APIs. Grant the built-in `sql_lab` role
+only to users who also have a `database_access` grant for the databases they may
+query in SQL Lab.
+
+Grant the permission to a role through FAB role administration. Roles remain
+permission bundles and are assigned to users through
+`AUTH_STATIC_ROLE_MAPPING`; the permission does not create per-user roles,
+dashboard viewers, or RLS subjects.
+
 ### Admin
 
 Admins have all possible rights, including granting or revoking rights from other

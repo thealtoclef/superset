@@ -61,6 +61,29 @@ def test_get_dataset_access_filters(mocker: MockerFixture) -> None:
     )
 
 
+def test_get_dataset_access_filters_includes_database_dataset_access(
+    mocker: MockerFixture,
+) -> None:
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.extensions import security_manager
+
+    mocker.patch.object(
+        security_manager,
+        "get_accessible_databases",
+        side_effect=[[1], [2]],
+    )
+    mocker.patch.object(
+        security_manager,
+        "user_view_menu_names",
+        side_effect=[set(), set(), set()],
+    )
+
+    clause = get_dataset_access_filters(SqlaTable)
+    engine = create_engine("sqlite://")
+    compiled_query = clause.compile(engine, compile_kwargs={"literal_binds": True})
+    assert "dbs.id IN (1, 2)" in str(compiled_query)
+
+
 def test_get_dataset_access_filters_extra_clauses(mocker: MockerFixture) -> None:
     """Named ``extra_access_clauses`` are OR-ed into the filter (the seam the
     dashboard and chart list filters use for the semantic-layer grant

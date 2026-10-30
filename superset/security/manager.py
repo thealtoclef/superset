@@ -2129,6 +2129,7 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         "catalog_access",
         "schema_access",
         "datasource_access",
+        "database_dataset_access",
     }
 
     ACCESSIBLE_PERMS = {"can_userinfo", "resetmypassword", "can_recent_activity"}
@@ -2582,6 +2583,11 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
             if self.can_access_database(database):
                 return True
 
+            # Database-level dataset access grants every dataset without
+            # granting database access, so SQL Lab stays denied.
+            if self.can_access("database_dataset_access", database.perm):
+                return True
+
             # Catalog-level access grants all schemas in catalog
             if (
                 hasattr(datasource, "catalog")
@@ -2944,7 +2950,9 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
 
         # add datasources with implicit permission (eg, database access)
         for database, datasources in datasources_by_database.items():
-            if self.can_access_database(database):
+            if self.can_access_database(database) or self.can_access(
+                "database_dataset_access", database.perm
+            ):
                 user_datasources.update(datasources)
 
         return list(user_datasources)
@@ -3023,13 +3031,16 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
             return {s.name for s in view_menu_names}
         return set()
 
-    def get_accessible_databases(self) -> list[int]:
+    def get_accessible_databases(
+        self, permission_name: str = "database_access"
+    ) -> list[int]:
         """
-        Return the list of databases accessible by the user.
+        Return the list of databases accessible by the user for a permission.
 
-        :return: The list of accessible Databases
+        :param permission_name: FAB permission name to inspect
+        :return: The list of accessible Database IDs
         """
-        perms = self.user_view_menu_names("database_access")
+        perms = self.user_view_menu_names(permission_name)
         return [
             int(match.group("id"))
             for perm in perms
@@ -3329,6 +3340,7 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
         logger.info("Creating missing database permissions.")
         for database in self.session.query(models.Database).all():
             merge_pv("database_access", database.perm)
+            merge_pv("database_dataset_access", database.perm)
 
         logger.info("Creating missing semantic layer and view permissions.")
         self._create_missing_semantic_perms(all_pvs)

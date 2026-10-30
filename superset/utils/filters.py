@@ -46,7 +46,10 @@ def get_dataset_access_filters(
     from superset import security_manager
     from superset.connectors.sqla.models import Database
 
-    database_ids = security_manager.get_accessible_databases()
+    database_ids = {
+        *security_manager.get_accessible_databases(),
+        *security_manager.get_accessible_databases("database_dataset_access"),
+    }
     perms = security_manager.user_view_menu_names("datasource_access")
     schema_perms = security_manager.user_view_menu_names("schema_access")
     catalog_perms = security_manager.user_view_menu_names("catalog_access")
