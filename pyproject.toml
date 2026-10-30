@@ -247,6 +247,11 @@ ocient = [
     "geojson",
 ]
 oracle = ["oracledb>=4.0.2, <5"]
+otel = [
+    "opentelemetry-sdk>=1.39.1, <2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.39.1, <2",
+    "opentelemetry-exporter-otlp-proto-http>=1.39.1, <2",
+]
 parseable = ["sqlalchemy-parseable>=0.1.6,<0.2.0"]
 pinot = ["pinotdb[sqlalchemy]>=8.0.0, <10.0.0"]
 playwright = ["playwright>=1.62.0, <2"]

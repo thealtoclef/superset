@@ -92,6 +92,10 @@ STATS_LOGGER = DummyStatsLogger()
 # https://github.com/apache/superset/blob/master/superset/utils/log.py
 EVENT_LOGGER = DBEventLogger()
 
+# When enabled, STATS_LOGGER and EVENT_LOGGER are replaced with OTLP-backed
+# implementations using OTEL_* environment variables.
+OTEL_LOGGING_ENABLED = False
+
 SUPERSET_LOG_VIEW = True
 
 # This config is used to enable/disable the following security menu items:
@@ -3496,6 +3500,11 @@ elif importlib.util.find_spec("superset_config"):
     except Exception:
         logger.exception("Found but failed to import local superset_config")
         raise
+
+if globals().get("OTEL_LOGGING_ENABLED", False):
+    from superset.telemetry.otel import create_otel_loggers
+
+    STATS_LOGGER, EVENT_LOGGER = create_otel_loggers()
 
 # Final environment variable processing - must be at the very end
 # to override any config file assignments

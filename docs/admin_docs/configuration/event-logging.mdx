@@ -44,6 +44,49 @@ End by updating your config to pass in an instance of the logger you want to use
 EVENT_LOGGER = JSONStdOutEventLogger()
 ```
 
+## OpenTelemetry Logging
+
+The fork includes OTLP-backed stats and event loggers. Database event logging is
+preserved: `OtelDBEventLogger` extends `DBEventLogger` and emits OTLP metrics in
+addition to writing the action log.
+
+Install the optional dependencies:
+
+```bash
+pip install "apache-superset[otel]"
+```
+
+Enable the loggers in `superset_config.py`:
+
+```python
+OTEL_LOGGING_ENABLED = True
+```
+
+Configure the exporter with environment variables:
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `OTEL_ENDPOINT` | yes | — | OTLP endpoint. gRPC: `host:4317`; HTTP: full URL ending in `/v1/metrics` |
+| `OTEL_SERVICE_NAME` / `OTEL_SERVICE` | no | `superset` | `service.name` resource attribute |
+| `OTEL_INTERVAL_MILLISECONDS` | no | `5000` | Export interval |
+| `OTEL_GRPC` | no | `true` | Use the gRPC exporter instead of HTTP |
+| `OTEL_PREFIX` | no | `superset` | Metric name prefix |
+
+When `OTEL_LOGGING_ENABLED` is true and `OTEL_ENDPOINT` is unset, startup fails
+instead of silently exporting to `localhost`.
+
+The loggers are applied after `superset_config.py` is loaded, so no import or
+instance assignment is needed in the deployment config. If you prefer explicit
+construction:
+
+```python
+from superset.telemetry.otel import create_otel_loggers
+
+STATS_LOGGER, EVENT_LOGGER = create_otel_loggers()
+```
+
+`create_otel_loggers()` reads the same environment variables.
+
 ## StatsD Logging
 
 Superset can be configured to log events to [StatsD](https://github.com/statsd/statsd)
