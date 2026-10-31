@@ -1257,6 +1257,32 @@ def test_update_oauth2_malformed_client_info_purges_tokens(
     purge_oauth2_tokens.assert_called_once()
 
 
+@pytest.mark.parametrize("encrypted_extra", ["", "   "])
+def test_update_oauth2_empty_encrypted_extra_does_not_crash(
+    mocker: MockerFixture,
+    app_context: None,
+    encrypted_extra: str,
+) -> None:
+    database = Database(database_name="db", sqlalchemy_uri="postgresql://")
+    mocker.patch.object(
+        database,
+        "get_oauth2_config",
+        return_value={
+            "id": "client",
+            "scope": "openid",
+            "authorization_request_uri": "https://idp/authorize",
+            "token_request_uri": "https://idp/token",
+        },
+    )
+    purge_oauth2_tokens = mocker.patch.object(database, "purge_oauth2_tokens")
+
+    command = UpdateDatabaseCommand(1, {"encrypted_extra": encrypted_extra})
+    command._model = database
+    command._handle_oauth2()
+
+    purge_oauth2_tokens.assert_called_once()
+
+
 def test_update_oauth2_unresolvable_endpoints_purges_tokens(
     mocker: MockerFixture,
     app_context: None,

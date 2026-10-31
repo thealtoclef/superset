@@ -194,15 +194,18 @@ class UpdateDatabaseCommand(BaseCommand):
         if not self._model:
             return
 
-        if self._properties["encrypted_extra"] is None:
+        encrypted_extra_json = self._properties["encrypted_extra"]
+        if encrypted_extra_json is None:
             self._model.purge_oauth2_tokens()
             return
+        if isinstance(encrypted_extra_json, str) and not encrypted_extra_json.strip():
+            encrypted_extra_json = "{}"
 
         current_config = self._model.get_oauth2_config()
         if not current_config:
             return
 
-        encrypted_extra = json.loads(self._properties["encrypted_extra"])
+        encrypted_extra = json.loads(encrypted_extra_json)
         new_config = self._resolve_oauth2_client_info(
             encrypted_extra.get("oauth2_client_info", {})
         )
