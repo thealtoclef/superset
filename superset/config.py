@@ -2256,6 +2256,10 @@ DB_CONNECTION_MUTATOR = None
 # through the Cloud SQL Python connector instead of a local auth proxy.
 CLOUDSQL_CONNECTOR_ENABLED = False
 
+# When enabled, AlloyDB URIs carrying alloydb_* query parameters are routed
+# through the AlloyDB Python connector.
+ALLOYDB_CONNECTOR_ENABLED = False
+
 
 # A callable that is invoked for every invocation of DB Engine Specs
 # which allows for custom validation of the engine URI.
@@ -3533,6 +3537,11 @@ if globals().get("CLOUDSQL_CONNECTOR_ENABLED", False):
 
     DB_CONNECTION_MUTATOR = with_cloudsql(globals().get("DB_CONNECTION_MUTATOR"))
 
+if globals().get("ALLOYDB_CONNECTOR_ENABLED", False):
+    from superset.databases.alloydb import with_alloydb
+
+    DB_CONNECTION_MUTATOR = with_alloydb(globals().get("DB_CONNECTION_MUTATOR"))
+
 # Final environment variable processing - must be at the very end
 # to override any config file assignments
 ENV_VAR_KEYS = {
@@ -3556,6 +3565,21 @@ if globals().get("CLOUDSQL_CONNECTOR_ENABLED", False):
         _metadata_url = make_url_safe(_metadata_uri)
         if "cloudsql_instance" in _metadata_url.query:
             _metadata_uri, _metadata_options = configure_cloudsql_uri(_metadata_url)
+            globals()["SQLALCHEMY_DATABASE_URI"] = _metadata_uri
+            globals()["SQLALCHEMY_ENGINE_OPTIONS"] = {
+                **(globals().get("SQLALCHEMY_ENGINE_OPTIONS") or {}),
+                **_metadata_options,
+            }
+
+if globals().get("ALLOYDB_CONNECTOR_ENABLED", False):
+    from superset.databases.alloydb import configure_alloydb_uri
+    from superset.databases.utils import make_url_safe
+
+    _metadata_uri = globals().get("SQLALCHEMY_DATABASE_URI")
+    if _metadata_uri:
+        _metadata_url = make_url_safe(_metadata_uri)
+        if "alloydb_instance" in _metadata_url.query:
+            _metadata_uri, _metadata_options = configure_alloydb_uri(_metadata_url)
             globals()["SQLALCHEMY_DATABASE_URI"] = _metadata_uri
             globals()["SQLALCHEMY_ENGINE_OPTIONS"] = {
                 **(globals().get("SQLALCHEMY_ENGINE_OPTIONS") or {}),

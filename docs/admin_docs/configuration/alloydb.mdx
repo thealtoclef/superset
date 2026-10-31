@@ -1,0 +1,125 @@
+---
+title: AlloyDB Connections
+sidebar_position: 11
+version: 1
+---
+
+# AlloyDB Connections
+
+The fork can connect to AlloyDB through the
+[AlloyDB Python connector](https://github.com/GoogleCloudPlatform/alloydb-python-connector)
+instead of a sidecar proxy. The connector uses Application Default Credentials
+(ADC), AlloyDB IAM authorization, and a TLS 1.3 channel managed by the
+connector.
+
+## Install
+
+```bash
+pip install "apache-superset[alloydb]"
+```
+
+The extra installs the connector with `pg8000`.
+
+## Enable
+
+```python
+ALLOYDB_CONNECTOR_ENABLED = True
+```
+
+The instance comes from the URI. There is no separate Superset-side instance
+allowlist. Whether the connector can connect is determined by the ADC
+principal's AlloyDB IAM authorization and database authentication. Scope the
+service account's AlloyDB access to the instances Superset is allowed to use.
+
+When enabled, `DB_CONNECTION_MUTATOR` is wrapped so URIs carrying `alloydb_*`
+parameters get a DBAPI `creator` and the parameters are removed before the URI
+reaches SQLAlchemy. An existing mutator runs first; the AlloyDB transformation
+then sees its final URI.
+
+## Database URIs
+
+PostgreSQL with IAM database authentication:
+
+```text
+postgresql+pg8000://sa@/db?alloydb_instance=projects/project/locations/region/clusters/cluster/instances/instance&alloydb_ip_type=PRIVATE&alloydb_enable_iam_auth=true
+```
+
+PostgreSQL with a password:
+
+```text
+postgresql+pg8000://user:password@/db?alloydb_instance=projects/project/locations/region/clusters/cluster/instances/instance&alloydb_ip_type=PRIVATE
+```
+
+| Parameter | Required | Default | Meaning |
+|---|---|---|---|
+| `alloydb_instance` | yes | — | `projects/<project>/locations/<region>/clusters/<cluster>/instances/<instance>` |
+| `alloydb_driver` | no | URL driver | `pg8000` |
+| `alloydb_ip_type` | no | `PRIVATE` | `PRIVATE`, `PUBLIC`, or `PSC` |
+| `alloydb_enable_iam_auth` | no | `false` | Use AlloyDB automatic IAM database authentication |
+
+The URI host is intentionally empty. The connector resolves the instance from
+`alloydb_instance`, not from the host.
+
+For IAM authentication, omit the password and use the IAM database user. For
+service accounts, omit the `.gserviceaccount.com` suffix; for user accounts, use
+the full email address. Percent-encode an `@` in the URI username as `%40`.
+
+## Metadata database
+
+The same `alloydb_*` URI parameters work for the Superset metadata database.
+When `ALLOYDB_CONNECTOR_ENABLED` is true, the final `SQLALCHEMY_DATABASE_URI`
+is rewritten after `superset_config.py` and
+`SUPERSET__SQLALCHEMY_DATABASE_URI` are applied:
+
+```python
+ALLOYDB_CONNECTOR_ENABLED = True
+SQLALCHEMY_DATABASE_URI = (
+    "postgresql+pg8000://sa@/superset"
+    "?alloydb_instance=projects/project/locations/region/clusters/cluster/instances/instance"
+    "&alloydb_ip_type=PRIVATE"
+    "&alloydb_enable_iam_auth=true"
+)
+```
+
+The URI is rewritten to a string, not a `URL` object, because Flask and Alembic
+read `SQLALCHEMY_DATABASE_URI` as a string. The migration environment forwards
+the `creator` from `SQLALCHEMY_ENGINE_OPTIONS` to its engine; pool-sizing
+options are ignored because migrations use `NullPool`.
+
+The rewrite happens before `superset db upgrade`, `superset init`, and the web
+and worker processes start, so the migration and init Jobs use the connector as
+well. `configure_alloydb_uri()` remains available for explicit programmatic
+configuration.
+
+## Credentials and networking
+
+The connector uses ADC. On GKE, use Workload Identity and grant the Kubernetes
+service account:
+
+- `roles/alloydb.client` for AlloyDB connection authorization;
+- an IAM database user when `alloydb_enable_iam_auth` is enabled.
+
+Private IP requires the cluster network to reach the instance's private IP;
+the connector does not create a proxy listener on `127.0.0.1`.
+
+## Engine behavior
+
+`configure_alloydb` returns:
+
+```python
+{
+    "creator": <AlloyDBCreator>,
+    "pool_pre_ping": True,
+    "pool_recycle": 1800,
+}
+```
+
+The creator caches one `Connector` per `(instance, ip_type, IAM)` and is lazy:
+constructing a creator does not start the connector's background thread until
+the first connection. The cache is cleared in forked children, so Celery
+prefork workers create their own connector.
+
+Non-TLS URL query options and `extra.engine_params.connect_args` are merged into
+the connector's driver arguments. TLS options are stripped because the
+connector already runs inside its own encrypted channel and derives
+certificates from the instance.

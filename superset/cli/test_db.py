@@ -280,11 +280,18 @@ def test_sqlalchemy_dialect(
     """
     Test the SQLAlchemy dialect, making sure it supports everything Superset needs.
     """
+    from superset.databases.alloydb import configure_alloydb
     from superset.databases.cloudsql import configure_cloudsql
 
     engine_uri: str | URL = sqlalchemy_uri
     url = make_url_safe(engine_uri)
-    if "cloudsql_instance" in url.query:
+    if "alloydb_instance" in url.query:
+        engine_uri, alloydb_options = configure_alloydb(
+            url,
+            connect_args=engine_kwargs.get("connect_args"),
+        )
+        engine_kwargs = {**engine_kwargs, **alloydb_options}
+    elif "cloudsql_instance" in url.query:
         engine_uri, cloud_sql_options = configure_cloudsql(
             url,
             connect_args=engine_kwargs.get("connect_args"),
