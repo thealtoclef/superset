@@ -18,6 +18,7 @@
 from typing import Any, Optional
 from unittest.mock import MagicMock, Mock, patch
 
+import jwt
 import pytest
 from pytest_mock import MockerFixture
 from sqlalchemy import JSON, types
@@ -631,3 +632,25 @@ def test_impersonate_user_without_token_starts_dance(
 
     with pytest.raises(RuntimeError, match="dance"):
         DorisEngineSpec.impersonate_user(database, "alice", None, url, {})
+
+
+def test_impersonate_user_uses_upstream_claim_without_database_oauth_client(
+    mocker: MockerFixture, app_context: None
+) -> None:
+    from superset.db_engine_specs.doris import DorisEngineSpec
+
+    mocker.patch.dict(
+        "superset.db_engine_specs.doris.current_app.config",
+        {"DATABASE_OAUTH2_CLIENTS": {}},
+    )
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    database.get_extra.return_value = {
+        "oauth2_upstream_username_claim": "email",
+    }
+    token = jwt.encode({"email": "alice@example.com"}, "secret", algorithm="HS256")
+    url = make_url("doris://old@host:9030/db")
+
+    result, _ = DorisEngineSpec.impersonate_user(database, "bob", token, url, {})
+
+    assert result.username == "alice@example.com"

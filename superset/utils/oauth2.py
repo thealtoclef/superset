@@ -43,6 +43,7 @@ from superset.exceptions import (
     OAuth2TokenRefreshInProgressError,
 )
 from superset.superset_typing import OAuth2ClientConfig, OAuth2State
+from superset.utils import json
 from superset.utils.execution_identity import get_execution_user
 
 if TYPE_CHECKING:
@@ -53,6 +54,16 @@ JWT_EXPIRATION = timedelta(minutes=5)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+# Reserved extension-storage namespace for the user's upstream login token.
+# The table already exists in Superset 7, so this needs no migration.
+UPSTREAM_OAUTH_STORAGE_ID = "superset.oauth2.upstream"
+
+
+def _upstream_provider(database: Database) -> str | None:
+    provider = database.get_upstream_oauth2_provider()
+    return provider if isinstance(provider, str) and provider else None
+
+
 _oauth2_retry_active: ContextVar[bool] = ContextVar(
     "oauth2_retry_active", default=False
 )
@@ -306,6 +317,11 @@ def execute_with_oauth2_retry(  # noqa: C901
     if database.get_oauth2_config() is None:
         return operation()
 
+    # Upstream login tokens are not refreshed through the database's OAuth2
+    # client. Do not let a rejected token start a second database OAuth flow.
+    if _upstream_provider(database) is not None:
+        return operation()
+
     execution_user = execution_user or get_execution_user()
     if execution_user is not None:
         user_id = execution_user.id
@@ -421,6 +437,218 @@ def execute_with_oauth2_retry(  # noqa: C901
 def is_oauth2_retry_active() -> bool:
     """Return whether an outer query execution can retry an OAuth2 failure."""
     return _oauth2_retry_active.get()
+
+
+def _upstream_token_expiration(
+    token_response: dict[str, Any],
+) -> datetime | None:
+    """Return the absolute expiry for an upstream token response."""
+    expires_in = token_response.get("expires_in")
+    if expires_in is None:
+        return None
+    try:
+        seconds = int(expires_in)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric OAuth2 expires_in value")
+        return None
+    return datetime.now(tz=timezone.utc) + timedelta(seconds=seconds)
+
+
+def _serialize_upstream_token(
+    token_response: dict[str, Any],
+    previous_refresh_token: str | None = None,
+) -> dict[str, Any]:
+    expires_at = _upstream_token_expiration(token_response)
+    return {
+        "access_token": token_response.get("access_token"),
+        "access_token_expiration": expires_at.isoformat() if expires_at else None,
+        "refresh_token": (
+            token_response.get("refresh_token") or previous_refresh_token
+        ),
+    }
+
+
+def _parse_upstream_token_expiration(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        expires_at = datetime.fromisoformat(value)
+    except ValueError:
+        logger.warning("Ignoring malformed upstream OAuth2 expiration")
+        return None
+    return (
+        expires_at
+        if expires_at.tzinfo is not None
+        else expires_at.replace(tzinfo=timezone.utc)
+    )
+
+
+def _get_upstream_token_payload(
+    provider: str,
+    user_id: int,
+) -> dict[str, Any] | None:
+    # pylint: disable=import-outside-toplevel
+    from superset.extensions.storage.persistent_dao import ExtensionStorageDAO
+
+    try:
+        payload = ExtensionStorageDAO.get_decoded_value(
+            UPSTREAM_OAUTH_STORAGE_ID,
+            provider,
+            user_fk=user_id,
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.warning(
+            "Unable to read upstream OAuth2 token for provider %s",
+            provider,
+            exc_info=True,
+        )
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def save_upstream_provider_token(
+    user_id: int,
+    provider: str,
+    token_response: dict[str, Any],
+    previous_refresh_token: str | None = None,
+) -> None:
+    """
+    Persist the login provider's token for a user.
+
+    Stored in the existing encrypted extension-storage table, scoped to the user
+    and keyed by provider. There is deliberately no database migration.
+    """
+    payload = _serialize_upstream_token(token_response, previous_refresh_token)
+    if not payload["access_token"]:
+        logger.warning(
+            "OAuth provider %s returned no access token; not storing it",
+            provider,
+        )
+        return
+
+    # pylint: disable=import-outside-toplevel
+    from superset.extensions.storage.persistent_dao import ExtensionStorageDAO
+
+    ExtensionStorageDAO.set(
+        UPSTREAM_OAUTH_STORAGE_ID,
+        provider,
+        json.dumps(payload).encode("utf-8"),
+        codec="json",
+        user_fk=user_id,
+        encrypt=True,
+    )
+
+
+def _delete_upstream_provider_token(provider: str, user_id: int) -> None:
+    # pylint: disable=import-outside-toplevel
+    from superset.extensions.storage.persistent_dao import ExtensionStorageDAO
+
+    if ExtensionStorageDAO.delete_by_key(
+        UPSTREAM_OAUTH_STORAGE_ID,
+        provider,
+        user_fk=user_id,
+    ):
+        db.session.commit()  # pylint: disable=consider-using-transaction
+
+
+def _upstream_token_is_valid(
+    payload: dict[str, Any],
+) -> tuple[str | None, datetime | None]:
+    access_token = payload.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        return None, None
+    expires_at = _parse_upstream_token_expiration(
+        payload.get("access_token_expiration")
+    )
+    if expires_at is None or datetime.now(tz=timezone.utc) < expires_at:
+        return access_token, expires_at
+    return None, expires_at
+
+
+def get_upstream_provider_token(provider: str, user_id: int) -> str | None:
+    """
+    Return a valid access token from the user's login provider.
+
+    Refreshes an expired token with the provider's refresh token when possible.
+    The refresh is serialized across workers so a rotating refresh token is
+    exchanged once.
+    """
+    payload = _get_upstream_token_payload(provider, user_id)
+    if payload is None:
+        return None
+
+    access_token, _ = _upstream_token_is_valid(payload)
+    if access_token:
+        return access_token
+
+    refresh_token = payload.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token:
+        return _refresh_upstream_provider_token(provider, user_id, refresh_token)
+
+    _delete_upstream_provider_token(provider, user_id)
+    return None
+
+
+def _refresh_upstream_provider_token(
+    provider: str,
+    user_id: int,
+    refresh_token: str,
+) -> str | None:
+    """Refresh an upstream token under a per-user/provider lock."""
+    with DistributedLock(
+        namespace="refresh_upstream_oauth_token",
+        ttl_seconds=30,
+        user_id=user_id,
+        provider=provider,
+    ):
+        # Another worker may have refreshed the token while this one waited.
+        payload = _get_upstream_token_payload(provider, user_id)
+        if payload is not None:
+            access_token, _ = _upstream_token_is_valid(payload)
+            if access_token:
+                return access_token
+            refresh_token = payload.get("refresh_token") or refresh_token
+
+        remote_app = app.extensions.get("authlib.integrations.flask_client", {}).get(
+            provider
+        )
+        if remote_app is None:
+            logger.warning(
+                "OAuth provider %s is not configured for token refresh",
+                provider,
+            )
+            _delete_upstream_provider_token(provider, user_id)
+            return None
+
+        try:
+            token_response = remote_app.fetch_access_token(
+                grant_type="refresh_token",
+                refresh_token=refresh_token,
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            # Keep the refresh token on transient failures so a later request
+            # can retry. Only a provider rejection means the grant is unusable.
+            if getattr(ex, "error", None) in {"invalid_grant", "invalid_token"}:
+                _delete_upstream_provider_token(provider, user_id)
+            logger.warning(
+                "Failed to refresh upstream OAuth2 token for provider %s",
+                provider,
+                exc_info=True,
+            )
+            return None
+
+        if not isinstance(token_response, dict) or "access_token" not in token_response:
+            _delete_upstream_provider_token(provider, user_id)
+            return None
+
+        save_upstream_provider_token(
+            user_id,
+            provider,
+            token_response,
+            previous_refresh_token=refresh_token,
+        )
+        access_token = token_response.get("access_token")
+        return access_token if isinstance(access_token, str) else None
 
 
 def encode_oauth2_state(state: OAuth2State) -> str:
@@ -549,6 +777,7 @@ def check_for_oauth2(
             not is_oauth2_retry_active()
             and execution_user is None
             and database.is_oauth2_enabled()
+            and _upstream_provider(database) is None
             and (
                 isinstance(ex, OAuth2TokenRefreshError)
                 or database.db_engine_spec.needs_oauth2(ex)

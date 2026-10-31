@@ -975,6 +975,77 @@ def test_get_sqla_engine_execution_user(mocker: MockerFixture) -> None:
     _ENGINE_CACHE.clear()
 
 
+def test_get_upstream_oauth2_provider_reads_extra() -> None:
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        extra='{"oauth2_upstream_provider": "entra"}',
+    )
+
+    assert database.get_upstream_oauth2_provider() == "entra"
+    assert database.is_oauth2_enabled() is True
+
+
+def test_get_sqla_engine_uses_upstream_token(
+    mocker: MockerFixture,
+) -> None:
+    from superset.models.core import _ENGINE_CACHE
+
+    _ENGINE_CACHE.clear()
+    user = SimpleNamespace(id=42, username="alice", email="alice@example.org")
+    get_upstream_token = mocker.patch(
+        "superset.models.core.get_upstream_provider_token",
+        return_value="upstream-token",
+    )
+    get_database_token = mocker.patch(
+        "superset.models.core.get_oauth2_access_token",
+    )
+    create_engine_mock = mocker.patch(
+        "superset.models.core.create_engine",
+        return_value=create_engine("sqlite://"),
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+        extra='{"oauth2_upstream_provider": "entra"}',
+    )
+    database.id = 1
+    mocker.patch.object(database, "get_oauth2_config", return_value=None)
+
+    database._get_sqla_engine(nullpool=False, execution_user=user)
+
+    get_upstream_token.assert_called_once_with("entra", 42)
+    get_database_token.assert_not_called()
+    connect_args = create_engine_mock.call_args.kwargs["connect_args"]
+    assert connect_args["user"] == "alice"
+    assert connect_args["http_session"].headers["Authorization"] == (
+        "Bearer upstream-token"
+    )
+    _ENGINE_CACHE.clear()
+
+
+def test_get_sqla_engine_requires_upstream_token_for_execution_user(
+    mocker: MockerFixture,
+) -> None:
+    user = SimpleNamespace(id=42, username="alice", email="alice@example.org")
+    mocker.patch(
+        "superset.models.core.get_upstream_provider_token",
+        return_value=None,
+    )
+    database = Database(
+        database_name="my_db",
+        sqlalchemy_uri="trino://",
+        impersonate_user=True,
+        extra='{"oauth2_upstream_provider": "entra"}',
+    )
+    database.id = 1
+    mocker.patch.object(database, "get_oauth2_config", return_value=None)
+
+    with pytest.raises(DatasetExecutionUserTokenMissingError):
+        database._get_sqla_engine(nullpool=False, execution_user=user)
+
+
 def test_get_sqla_engine_uses_context_execution_user(
     mocker: MockerFixture,
 ) -> None:

@@ -176,7 +176,7 @@ class DorisEngineSpec(MySQLEngineSpec):
         if user_token is None:
             cls.start_oauth2_dance(database)
         url = url.set(
-            username=cls._oauth2_login(username, user_token),
+            username=cls._oauth2_login(username, user_token, database),
             password=user_token,
         )
         engine_kwargs.setdefault("connect_args", {})["ssl_mode"] = (
@@ -185,13 +185,27 @@ class DorisEngineSpec(MySQLEngineSpec):
         return url, engine_kwargs
 
     @classmethod
-    def _oauth2_login(cls, username: str | None, user_token: str | None) -> str | None:
+    def _oauth2_login(
+        cls,
+        username: str | None,
+        user_token: str | None,
+        database: Database | None = None,
+    ) -> str | None:
         """Return the login Doris compares against its OIDC subject_claim."""
         config = current_app.config.get("DATABASE_OAUTH2_CLIENTS", {}).get(
             cls.engine_name, {}
         )
-        claim = config.get("username_claim")
-        if not claim or not user_token:
+        extra_claim = (
+            database.get_extra().get("oauth2_upstream_username_claim")
+            if database is not None
+            else None
+        )
+        claim = (
+            extra_claim
+            if isinstance(extra_claim, str) and extra_claim
+            else config.get("username_claim")
+        )
+        if not isinstance(claim, str) or not claim or not user_token:
             return username
         try:
             claims = jwt.decode(user_token, options={"verify_signature": False})

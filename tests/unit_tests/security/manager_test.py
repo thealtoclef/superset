@@ -24,13 +24,16 @@ from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
-from flask import current_app
+from flask import current_app, g, session
 from flask_appbuilder.const import (
     AUTH_DB,
     AUTH_LDAP,
     AUTH_OAUTH,
     AUTH_REMOTE_USER,
     AUTH_SAML,
+)
+from flask_appbuilder.security.sqla.manager import (
+    SecurityManager as FabSecurityManager,
 )
 from flask_appbuilder.security.sqla.models import Role, User
 from pytest_mock import MockerFixture
@@ -5531,6 +5534,43 @@ def test_is_editor_other_model_with_user_id_not_editor(
 
     tab_state = TabState(user_id=100)
     assert sm.is_editor(tab_state) is False
+
+
+def test_oauth_login_persists_upstream_token_without_session_leak(
+    mocker: MockerFixture,
+    app_context: None,
+) -> None:
+    sm = SupersetSecurityManager(appbuilder)
+    mocker.patch.object(FabSecurityManager, "set_oauth_session")
+    user = MagicMock(id=7)
+    mocker.patch.object(FabSecurityManager, "auth_user_oauth", return_value=user)
+    save = mocker.patch("superset.utils.oauth2.save_upstream_provider_token")
+    mocker.patch.dict(
+        current_app.config,
+        {"OAUTH_PROVIDERS": [{"name": "entra", "save_token": True}]},
+    )
+
+    with current_app.test_request_context():
+        sm.set_oauth_session(
+            "entra",
+            {
+                "access_token": "access-token",  # noqa: S105
+                "refresh_token": "refresh-token",  # noqa: S105
+            },
+        )
+        assert sm.auth_user_oauth({}) is user
+        assert not hasattr(g, "_oauth2_upstream_token")
+        assert not hasattr(g, "_oauth2_upstream_provider")
+        assert "oauth_full_token" not in session
+
+    save.assert_called_once_with(
+        7,
+        "entra",
+        {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",  # noqa: S106
+        },
+    )
 
 
 def _pvm(permission: str, view_menu: str) -> SimpleNamespace:

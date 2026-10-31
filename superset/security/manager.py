@@ -6371,6 +6371,56 @@ class SupersetSecurityManager(  # pylint: disable=too-many-public-methods
             return DEFAULT_GUEST_TOKEN_REVOCATION_VERSION
         return get_current_guest_token_revocation_version()
 
+    def set_oauth_session(self, provider: str, oauth_response: dict[str, Any]) -> None:
+        """
+        Keep the full login token in request-local state.
+
+        FAB reduces the OAuth response to ``(access_token, secret)`` in the
+        session. The refresh token is only needed until ``auth_user_oauth``
+        persists it server-side, so it is kept in ``g`` instead of the
+        signed session cookie.
+        """
+        super().set_oauth_session(provider, oauth_response)
+        g._oauth2_upstream_token = dict(oauth_response)
+        g._oauth2_upstream_provider = provider
+
+    def auth_user_oauth(self, userinfo: dict[str, Any]) -> Any:
+        """
+        Persist the login provider token when the provider opts in.
+
+        Databases select a provider through ``extra.oauth2_upstream_provider``;
+        the token itself is stored once per user/provider in encrypted
+        extension storage, so no schema migration is required.
+        """
+        token = getattr(g, "_oauth2_upstream_token", None)
+        provider = getattr(g, "_oauth2_upstream_provider", None)
+        try:
+            user = super().auth_user_oauth(userinfo)
+            if user and token and provider:
+                provider_config = next(
+                    (
+                        config
+                        for config in current_app.config.get("OAUTH_PROVIDERS", [])
+                        if config.get("name") == provider
+                    ),
+                    None,
+                )
+                if provider_config and provider_config.get("save_token"):
+                    from superset.utils.oauth2 import save_upstream_provider_token
+
+                    try:
+                        save_upstream_provider_token(user.id, provider, token)
+                    except Exception:  # pylint: disable=broad-except
+                        logger.warning(
+                            "Failed to save upstream OAuth token for provider %s",
+                            provider,
+                            exc_info=True,
+                        )
+            return user
+        finally:
+            g.pop("_oauth2_upstream_token", None)
+            g.pop("_oauth2_upstream_provider", None)
+
     def get_guest_user_from_request(self, req: Request) -> Optional[GuestUser]:
         """
         If there is a guest token in the request (used for embedded),

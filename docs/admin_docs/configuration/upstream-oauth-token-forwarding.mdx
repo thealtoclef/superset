@@ -1,0 +1,131 @@
+---
+title: Upstream OAuth token forwarding
+sidebar_position: 11
+version: 1
+---
+
+# Upstream OAuth token forwarding
+
+A database can reuse the OAuth access token the user obtained when signing in
+to Superset, instead of starting a second OAuth flow for the database. This is
+useful for engines such as Trino and Doris that accept an OIDC bearer token and
+map it to a database user.
+
+The feature needs no database migration. The token is stored in the existing
+`extension_storage` table, encrypted with a key derived from `SECRET_KEY` and
+the user ID.
+
+## Configure the login provider
+
+Add `save_token` to the Superset login provider. Include the database's audience
+or scope in the provider request, because the database must accept the token
+Superset received at login.
+
+```python
+OAUTH_PROVIDERS = [
+    {
+        "name": "entra",
+        "save_token": True,
+        "remote_app": {
+            "client_kwargs": {
+                "scope": "openid profile email offline_access <database-scope>"
+            },
+            # ...
+        },
+    },
+]
+```
+
+`save_token` is opt-in. Without it, Superset does not persist the login token.
+
+## Select the provider per database
+
+Set `oauth2_upstream_provider` in the database's `extra` JSON:
+
+```json
+{
+  "oauth2_upstream_provider": "entra"
+}
+```
+
+Doris can also derive the database login from a token claim:
+
+```json
+{
+  "oauth2_upstream_provider": "entra",
+  "oauth2_upstream_username_claim": "email"
+}
+```
+
+The claim is read from the already-issued login token. No
+`DATABASE_OAUTH2_CLIENTS` entry is required for upstream token forwarding.
+
+The database must also use impersonation where the engine supports it:
+
+```text
+impersonate_user = true
+```
+
+The provider name in `extra` must match the `name` in `OAUTH_PROVIDERS`.
+
+For config-as-code, the same fields can be set in the datasource YAML:
+
+```yaml
+databases:
+  - database_name: cake-doris
+    sqlalchemy_uri: doris://...
+    impersonate_user: true
+    extra: '{"oauth2_upstream_provider": "entra", "oauth2_upstream_username_claim": "email"}'
+```
+
+## Supported engines
+
+The forwarding layer is engine-independent: it resolves a token and passes it
+to the engine spec's `impersonate_user` method. It therefore works for engines
+whose spec consumes a user token and whose database accepts the login
+provider's token. In this fork those are Doris, Trino, Databricks, Google Sheets,
+and Snowflake.
+
+It does not add OAuth2 support to an engine that lacks it, and it does not make
+a database accept a token from a different issuer or audience. For example, a
+Google Sheets connection needs a Google login provider, and a Trino/Doris
+connection needs the provider to issue a token whose audience and scope those
+systems validate.
+
+## Runtime behavior
+
+At login, Superset stores the provider's access token, refresh token, and
+expiry once per user and provider. The refresh token is never written to the
+Flask session; it is kept only in request-local state until it is persisted.
+
+At query time:
+
+1. Superset resolves the token for the effective user. This is the signed-in
+   viewer normally, or the dataset execution user when dataset execution
+   identity is enabled.
+2. A valid access token is passed to the engine spec's `impersonate_user`.
+3. An expired token is refreshed through the login provider under a
+   per-user/provider distributed lock.
+4. If no token is available, Superset does not start a second database OAuth
+   flow. Viewer requests fail with an OAuth2 error; dataset execution-user
+   requests fail with the existing execution-user token error.
+
+When a database also has its own OAuth2 client configured,
+`oauth2_upstream_provider` takes precedence. If no upstream token is available,
+Superset falls back to the database-specific OAuth2 token.
+
+Without `oauth2_upstream_username_claim`, the Doris engine spec uses the
+effective Superset username. A `DATABASE_OAUTH2_CLIENTS` entry can still
+supply `username_claim`, but it is not required for forwarding.
+
+## Security notes
+
+- Stored tokens are encrypted at rest through the existing extension-storage
+  encryption path.
+- Access and refresh tokens are scoped to the user and provider. Rotating
+  refresh tokens are exchanged once under a distributed lock.
+- The login token is not stored in the signed Flask session. FAB's existing
+  `session["oauth"]` access-token pair is unchanged.
+- A database token is only as useful as the audience and scopes the identity
+  provider issued. Configure the provider request and the database's OIDC
+  validation together.

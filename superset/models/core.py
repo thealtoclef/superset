@@ -71,6 +71,7 @@ from superset.databases.utils import make_url_safe
 from superset.db_engine_specs.base import MetricType, TimeGrain
 from superset.exceptions import (
     DatasetExecutionUserTokenMissingError,
+    OAuth2Error,
     OAuth2TokenRefreshError,
     OAuth2TokenRefreshInProgressError,
     SupersetGenericDBErrorException,
@@ -103,6 +104,7 @@ from superset.utils.oauth2 import (
     check_for_oauth2,
     execute_with_oauth2_retry,
     get_oauth2_access_token,
+    get_upstream_provider_token,
     has_stored_oauth2_token,
     OAuth2ClientConfigSchema,
 )
@@ -761,24 +763,32 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         )
 
         oauth2_config = self.get_oauth2_config()
+        upstream_provider = self.get_upstream_oauth2_provider()
+        oauth2_enabled = bool(
+            oauth2_config
+            or upstream_provider
+            or self.db_engine_spec.is_oauth2_enabled()
+        )
         if execution_user is not None:
             user_id = execution_user.id
         else:
             user_id = getattr(getattr(g, "user", None), "id", None)
         try:
             access_token = (
-                get_oauth2_access_token(
+                get_upstream_provider_token(upstream_provider, user_id)
+                if upstream_provider and user_id is not None
+                else None
+            )
+            if access_token is None and oauth2_config and user_id is not None:
+                access_token = get_oauth2_access_token(
                     oauth2_config,
                     self.id,
                     user_id,
                     self.db_engine_spec,
                     durable=execution_user is not None,
                 )
-                if oauth2_config and user_id is not None
-                else None
-            )
         except OAuth2TokenRefreshError:
-            if execution_user is not None and self.impersonate_user and oauth2_config:
+            if execution_user is not None and self.impersonate_user and oauth2_enabled:
                 raise DatasetExecutionUserTokenMissingError(
                     execution_user.username, self.name
                 ) from None
@@ -786,13 +796,18 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         if (
             execution_user is not None
             and self.impersonate_user
-            and oauth2_config
+            and oauth2_enabled
             and access_token is None
         ):
             if has_stored_oauth2_token(self.id, user_id):
                 raise OAuth2TokenRefreshInProgressError()
             raise DatasetExecutionUserTokenMissingError(
                 execution_user.username, self.name
+            )
+        if self.impersonate_user and upstream_provider and access_token is None:
+            raise OAuth2Error(
+                "No OAuth2 token is available for this database. "
+                "Sign in again to refresh it."
             )
         masked_url = self.get_password_masked_url(sqlalchemy_url)
         logger.debug("Database._get_sqla_engine(). Masked URL: %s", str(masked_url))
@@ -1643,6 +1658,23 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
         sqla_col.key = label_expected
         return sqla_col
 
+    def get_upstream_oauth2_provider(self) -> str | None:
+        """
+        Return the login provider whose token is forwarded to this database.
+
+        The setting lives in the database ``extra`` JSON, so it needs no
+        schema change or database-level OAuth2 client.
+        """
+        try:
+            extra = json.loads(self.extra or "{}")
+        except json.JSONDecodeError as ex:
+            logger.error(ex, exc_info=True)
+            raise SupersetGenericDBErrorException(message=str(ex)) from ex
+        provider = extra.get("oauth2_upstream_provider")
+        return (
+            provider.strip() if isinstance(provider, str) and provider.strip() else None
+        )
+
     def is_oauth2_enabled(self) -> bool:
         """
         Is OAuth2 enabled in the database for authentication?
@@ -1658,7 +1690,11 @@ class Database(CoreDatabase, AuditMixinNullable, ImportExportMixin):  # pylint: 
             logger.warning("Invalid OAuth2 client configuration for database %s", self)
             client_config = None
 
-        return client_config is not None or self.db_engine_spec.is_oauth2_enabled()
+        return (
+            client_config is not None
+            or self.get_upstream_oauth2_provider() is not None
+            or self.db_engine_spec.is_oauth2_enabled()
+        )
 
     def get_oauth2_config(self) -> OAuth2ClientConfig | None:
         """

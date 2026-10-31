@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import cast
 
 import pytest
+from flask import current_app
 from freezegun import freeze_time
 from pytest_mock import MockerFixture
 from sqlalchemy import Column, create_engine, DateTime, Integer, String
@@ -41,6 +42,7 @@ from superset.exceptions import (
     OAuth2TokenRefreshInProgressError,
 )
 from superset.superset_typing import OAuth2ClientConfig
+from superset.utils import json
 from superset.utils.oauth2 import (
     check_for_oauth2,
     decode_oauth2_state,
@@ -50,7 +52,9 @@ from superset.utils.oauth2 import (
     generate_code_verifier,
     get_oauth2_access_token,
     get_oauth2_redirect_uri,
+    get_upstream_provider_token,
     refresh_oauth2_token,
+    save_upstream_provider_token,
 )
 
 DUMMY_OAUTH2_CONFIG = cast(OAuth2ClientConfig, {})
@@ -716,6 +720,165 @@ def test_refresh_oauth2_token_returns_none_when_row_deleted_under_lock(
 
     assert result is None
     db_engine_spec.get_oauth2_fresh_token.assert_not_called()
+
+
+def test_save_upstream_provider_token_persists_encrypted_payload(
+    mocker: MockerFixture,
+) -> None:
+    """The login token is written once per user/provider to encrypted storage."""
+    storage_set = mocker.patch(
+        "superset.extensions.storage.persistent_dao.ExtensionStorageDAO.set"
+    )
+
+    with freeze_time("2024-01-01"):
+        save_upstream_provider_token(
+            7,
+            "entra",
+            {
+                "access_token": "access-token",  # noqa: S105
+                "refresh_token": "refresh-token",  # noqa: S105
+                "expires_in": 60,
+            },
+        )
+
+    storage_set.assert_called_once()
+    args, kwargs = storage_set.call_args
+    assert args[0] == "superset.oauth2.upstream"
+    assert args[1] == "entra"
+    payload = json.loads(args[2])
+    assert payload == {
+        "access_token": "access-token",
+        "access_token_expiration": "2024-01-01T00:01:00+00:00",
+        "refresh_token": "refresh-token",
+    }
+    assert kwargs == {"codec": "json", "user_fk": 7, "encrypt": True}
+
+
+def test_get_upstream_provider_token_returns_non_expiring_token(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "superset.utils.oauth2._get_upstream_token_payload",
+        return_value={"access_token": "access-token"},
+    )
+
+    assert get_upstream_provider_token("entra", 7) == "access-token"
+
+
+def test_get_upstream_provider_token_deletes_expired_without_refresh(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "superset.utils.oauth2._get_upstream_token_payload",
+        return_value={
+            "access_token": "access-token",
+            "access_token_expiration": "2024-01-01T00:00:00+00:00",
+        },
+    )
+    delete = mocker.patch("superset.utils.oauth2._delete_upstream_provider_token")
+
+    with freeze_time("2024-01-02"):
+        assert get_upstream_provider_token("entra", 7) is None
+
+    delete.assert_called_once_with("entra", 7)
+
+
+def test_get_upstream_provider_token_refreshes_and_preserves_refresh_token(
+    mocker: MockerFixture,
+    app_context: None,
+) -> None:
+    payload = {
+        "access_token": "expired-token",
+        "access_token_expiration": "2024-01-01T00:00:00+00:00",
+        "refresh_token": "refresh-token",  # noqa: S105
+    }
+    mocker.patch(
+        "superset.utils.oauth2._get_upstream_token_payload",
+        return_value=payload,
+    )
+    mocker.patch("superset.utils.oauth2.DistributedLock")
+    remote_app = mocker.MagicMock()
+    remote_app.fetch_access_token.return_value = {"access_token": "new-token"}
+    mocker.patch.dict(
+        current_app.extensions,
+        {"authlib.integrations.flask_client": {"entra": remote_app}},
+    )
+    save = mocker.patch("superset.utils.oauth2.save_upstream_provider_token")
+
+    with freeze_time("2024-01-02"):
+        assert get_upstream_provider_token("entra", 7) == "new-token"
+
+    remote_app.fetch_access_token.assert_called_once_with(
+        grant_type="refresh_token",
+        refresh_token="refresh-token",  # noqa: S106
+    )
+    save.assert_called_once_with(
+        7,
+        "entra",
+        {"access_token": "new-token"},
+        previous_refresh_token="refresh-token",  # noqa: S106
+    )
+
+
+@pytest.mark.parametrize(
+    "error,deleted",
+    [
+        ("invalid_grant", True),
+        ("temporarily_unavailable", False),
+    ],
+)
+def test_refresh_upstream_token_only_deletes_rejected_grants(
+    mocker: MockerFixture,
+    app_context: None,
+    error: str,
+    deleted: bool,
+) -> None:
+    payload = {
+        "access_token": "expired-token",
+        "access_token_expiration": "2024-01-01T00:00:00+00:00",
+        "refresh_token": "refresh-token",  # noqa: S105
+    }
+    mocker.patch(
+        "superset.utils.oauth2._get_upstream_token_payload",
+        return_value=payload,
+    )
+    mocker.patch("superset.utils.oauth2.DistributedLock")
+    remote_app = mocker.MagicMock()
+
+    class ProviderError(Exception):
+        pass
+
+    provider_error = ProviderError(error)
+    provider_error.error = error  # type: ignore[attr-defined]
+    remote_app.fetch_access_token.side_effect = provider_error
+    mocker.patch.dict(
+        current_app.extensions,
+        {"authlib.integrations.flask_client": {"entra": remote_app}},
+    )
+    delete = mocker.patch("superset.utils.oauth2._delete_upstream_provider_token")
+
+    with freeze_time("2024-01-02"):
+        assert get_upstream_provider_token("entra", 7) is None
+
+    assert delete.called is deleted
+
+
+def test_check_for_oauth2_does_not_start_dance_for_upstream_provider(
+    mocker: MockerFixture,
+) -> None:
+    database = mocker.MagicMock()
+    database.is_oauth2_enabled.return_value = True
+    database.get_upstream_oauth2_provider.return_value = "entra"
+    start_dance = mocker.patch.object(
+        BaseEngineSpec,
+        "start_oauth2_dance",
+    )
+
+    with pytest.raises(OAuth2TokenRefreshError):
+        with check_for_oauth2(database):
+            raise OAuth2TokenRefreshError()
+
+    start_dance.assert_not_called()
 
 
 def test_generate_code_verifier_length() -> None:
