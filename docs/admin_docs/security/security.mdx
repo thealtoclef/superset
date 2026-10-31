@@ -72,10 +72,63 @@ or the registration role are removed. `AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT`
 applies the same mapping to all active users during `superset init`, so a
 deployment init Job can replace periodic cron-based reconciliation.
 
-Referenced roles must already exist. Missing roles are logged and skipped.
-This is role assignment only: it does not create the roles, their permissions,
-dashboard viewers, or RLS subjects. Leave `AUTH_ROLES_MAPPING` empty when the
-IdP has no group claims.
+`sync_roles` (below) creates roles referenced by `AUTH_STATIC_ROLE_MAPPING` and
+`AUTH_ROLES_MAPPING`, so run it before `superset init` when using
+`AUTH_STATIC_ROLE_MAPPING_SYNC_ON_INIT`. At login, a role that is still missing
+is logged and skipped. Static mapping is role assignment only: it does not
+create permissions, dashboard viewers, or RLS subjects. Leave
+`AUTH_ROLES_MAPPING` empty when the IdP has no group claims.
+
+### Declarative roles
+
+`sync_roles` makes the role list authoritative and removes stale roles:
+
+```yaml
+# sync_roles.yaml
+roles:
+  - doris_platform
+  - finance_analysts
+  - team_finance_datasets
+  - team_finance_sql
+  - team_platform
+
+# Optional escape hatch for roles managed outside this file.
+protected_roles:
+  - manually_managed_role
+```
+
+```bash
+superset sync_roles -p /app/configs/sync_roles.yaml
+```
+
+It creates missing roles and deletes every other role that is not:
+
+- a built-in Superset role (`Admin`, `Alpha`, `Gamma`, `Public`, `sql_lab`),
+- referenced by `AUTH_STATIC_ROLE_MAPPING` or `AUTH_ROLES_MAPPING`,
+- `AUTH_ROLE_ADMIN`, `AUTH_ROLE_PUBLIC`, `AUTH_USER_REGISTRATION_ROLE`, or
+  `PUBLIC_ROLE_LIKE`, or
+- listed under `protected_roles`.
+
+Deletion is destructive: role permissions, user and group memberships, and
+dashboard/RLS subjects attached to the role are removed with it. `roles` may
+also be a mapping whose keys are role names, for example `team_finance: {}`.
+Put every role used by `sync_access.yaml` in `sync_roles.yaml`, unless auth
+configuration already references it. `sync_roles` does not grant permissions;
+`sync_access` does that next.
+
+Use this order so roles exist before static mapping is applied during init:
+
+```bash
+superset db upgrade
+superset sync_roles -p /app/configs/sync_roles.yaml
+superset init
+superset sync_datasources -p /app/configs/import_datasources.yaml
+superset sync_access -p /app/configs/sync_access.yaml
+```
+
+On a fresh database `sync_roles` does not create the built-in roles;
+`superset init` does. Running `sync_roles` after `init` still works, but
+existing users receive newly mapped roles on their next login or the next init.
 
 ### Database dataset access
 
@@ -132,9 +185,10 @@ Run it after the init/import steps:
 superset sync_access -p /app/configs/sync_access.yaml
 ```
 
-Every listed member must be an existing role. The command fails on an unknown
-role and never creates roles, per-user roles, dashboard viewers, or RLS subjects.
-Users receive these roles through `AUTH_STATIC_ROLE_MAPPING` or FAB.
+Every listed member must be an existing role. Create them with `sync_roles`;
+`sync_access` fails on an unknown role and never creates roles, per-user roles,
+dashboard viewers, or RLS subjects. Users receive these roles through
+`AUTH_STATIC_ROLE_MAPPING` or FAB.
 
 The command is authoritative for managed database PVMs. It removes
 `database_access` and `database_dataset_access` grants that are not listed for a
@@ -151,6 +205,13 @@ removes the membership. The built-in Admin role is skipped.
 ```bash
 superset sync_datasources -p /app/configs/import_datasources.yaml
 ```
+
+Scalar values may contain `${VAR}` placeholders, expanded from the process
+environment at import time. Unknown variables stay literal, and only the
+explicit `${VAR}` form is expanded; a bare `$` is left untouched. Expansion is
+in memory and happens after YAML parsing, so secrets containing YAML syntax do
+not alter the document. The resulting URI is imported normally and is encrypted
+and masked by `Database.set_sqlalchemy_uri`.
 
 Databases absent from the file are deleted only when no datasets or reports
 reference them. A blocked database is logged with its dataset IDs and any

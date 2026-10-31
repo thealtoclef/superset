@@ -20,7 +20,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from pathlib import Path
+from typing import Any
 
 import click
 import yaml
@@ -35,19 +38,33 @@ from superset.models.core import Database
 
 logger = logging.getLogger(__name__)
 
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-def _load_config(path: Path) -> tuple[str, set[str]]:
-    raw = path.read_text(encoding="utf-8")
-    try:
-        config = yaml.safe_load(raw) or {}
-    except yaml.YAMLError as ex:
-        raise click.ClickException(f"{path} is not valid YAML") from ex
 
-    if not isinstance(config, dict):
-        raise click.ClickException("Datasource config must be a YAML mapping")
-    if "databases" not in config:
-        raise click.ClickException("Datasource config has no 'databases' key")
+def _expand_env(raw: str) -> str:
+    """Replace ${VAR} placeholders from the environment.
 
+    Unknown variables stay literal so a missing secret fails at import time
+    instead of silently becoming an empty string. Only the explicit ${VAR}
+    form is expanded; a bare ``$`` is left untouched for URIs and JSON.
+    """
+    return _ENV_PLACEHOLDER.sub(
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        raw,
+    )
+
+
+def _expand_env_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _expand_env(value)
+    if isinstance(value, list):
+        return [_expand_env_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand_env_value(item) for key, item in value.items()}
+    return value
+
+
+def _database_names(config: dict[str, Any]) -> list[str]:
     databases = config["databases"]
     if not isinstance(databases, list):
         raise click.ClickException("Datasource config 'databases' must be a list")
@@ -63,6 +80,28 @@ def _load_config(path: Path) -> tuple[str, set[str]]:
 
     if len(names) != len(set(names)):
         raise click.ClickException("Duplicate database_name in datasource config")
+    return names
+
+
+def _load_config(path: Path) -> tuple[str, set[str]]:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        config = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as ex:
+        raise click.ClickException(f"{path} is not valid YAML") from ex
+
+    if not isinstance(config, dict):
+        raise click.ClickException("Datasource config must be a YAML mapping")
+    if "databases" not in config:
+        raise click.ClickException("Datasource config has no 'databases' key")
+
+    names = _database_names(config)
+    if _ENV_PLACEHOLDER.search(raw):
+        # Expand values after parsing so a secret containing YAML syntax (for
+        # example ``#``, ``: `` or a newline) cannot alter the document.
+        config = _expand_env_value(config)
+        names = _database_names(config)
+        raw = yaml.safe_dump(config, sort_keys=False)
 
     return raw, set(names)
 

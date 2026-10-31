@@ -19,10 +19,67 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from click.testing import CliRunner
 from pytest_mock import MockerFixture
 
 from superset.cli import sync_datasources
+
+
+def test_expand_env_replaces_only_declared_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DB_PASSWORD", "s3cret")
+
+    raw = sync_datasources._expand_env(
+        "password=${DB_PASSWORD}&literal=$HOME&unknown=${NOPE}"
+        '&extra={"password":"$value"}'
+    )
+
+    assert raw == (
+        'password=s3cret&literal=$HOME&unknown=${NOPE}&extra={"password":"$value"}'
+    )
+
+
+def test_load_config_expands_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DB_PASSWORD", "s3cret")
+    path = tmp_path / "datasources.yaml"
+    path.write_text(
+        "databases:\n"
+        "  - database_name: cake-x\n"
+        "    sqlalchemy_uri: mysql://user:${DB_PASSWORD}@host/db\n",
+        encoding="utf-8",
+    )
+
+    raw, desired = sync_datasources._load_config(path)
+
+    assert "s3cret" in raw
+    assert "${DB_PASSWORD}" not in raw
+    assert desired == {"cake-x"}
+
+
+def test_load_config_handles_yaml_special_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DB_PASSWORD", 'p#ss: "word"')
+    path = tmp_path / "datasources.yaml"
+    path.write_text(
+        "databases:\n"
+        "  - database_name: cake-x\n"
+        "    sqlalchemy_uri: mysql://user:${DB_PASSWORD}@host/db\n",
+        encoding="utf-8",
+    )
+
+    raw, _ = sync_datasources._load_config(path)
+
+    parsed = yaml.safe_load(raw)
+    assert parsed["databases"][0]["sqlalchemy_uri"] == (
+        'mysql://user:p#ss: "word"@host/db'
+    )
 
 
 def test_load_config_requires_databases(tmp_path: Path) -> None:
