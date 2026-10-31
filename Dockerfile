@@ -136,6 +136,10 @@ FROM python:${PY_VER} AS python-base
 ARG SUPERSET_HOME="/app/superset_home"
 ENV SUPERSET_HOME=${SUPERSET_HOME}
 
+# Apply base image security updates.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
 RUN mkdir -p ${SUPERSET_HOME}
 RUN useradd --user-group -d ${SUPERSET_HOME} -m --no-log-init --shell /bin/bash superset \
     && chmod -R 1777 ${SUPERSET_HOME} \
@@ -303,25 +307,29 @@ RUN /app/docker/apt-install.sh \
     pkg-config \
     default-libmysqlclient-dev
 
-# Bundle the common metadata/analytics drivers (postgres, mysql) and the
-# MCP server dependencies (fastmcp) so the default image is usable without
-# layering extra packages. Routed through pip-install.sh because mysqlclient
-# is a source dist that needs a C compiler to build; the helper installs
-# build-essential just for the build and purges it afterward (the lean base
-# ships no compiler). The mysql client lib installed above stays, so the
+# Bundle the common metadata/analytics drivers (postgres, mysql, BigQuery,
+# Doris, RisingWave), database drivers (Cloud SQL, AlloyDB, Spanner),
+# OpenTelemetry, Sentry, MCP, and Playwright so the default image is usable
+# without layering extra packages. Routed through pip-install.sh because
+# mysqlclient is a source dist that needs a C compiler to build; the helper
+# installs build-essential just for the build and purges it afterward (the lean
+# base ships no compiler). The mysql client lib installed above stays, so the
 # compiled extension can link against it at runtime.
 RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
-    /app/docker/pip-install.sh --requires-build-essential .[postgres,mysql,fastmcp]
+    /app/docker/pip-install.sh --requires-build-essential .[postgres,mysql,bigquery,doris,fastmcp,otel,cloudsql,alloydb,playwright,risingwave,sentry,spanner]
 
 # Bundle Playwright + a headless Chromium so Alerts & Reports and thumbnail
 # generation work out of the box. Installed directly (rather than via the
 # INCLUDE_CHROMIUM build arg on python-common) because this stage builds
 # FROM lean, which is already past that arg. Chromium ships for both
 # linux/amd64 and linux/arm64, so this works on multi-platform builds.
-RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
-    uv pip install playwright \
-    && playwright install-deps \
+RUN playwright install-deps chromium \
     && playwright install chromium
+
+# Clean build-only packages and apt caches from the final image.
+RUN apt-get purge -y --auto-remove build-essential pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 USER superset
 
